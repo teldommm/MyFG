@@ -1089,7 +1089,11 @@ private:
         return hz;
     }
     void voteGameRate() {             // немедленный перевыбор голоса окна игры (смена состояния терм)
-        if (!winRate_) return;
+        // №9: голосуем только при тех же условиях, что и периодический голос в housekeeping:
+        // модуль включён, panel_game_vote=1 и есть что голосовать. При выключении модуля голос
+        // с окна снимается — терм не должен ни ставить новый (перегрев), ни возвращать снятый
+        // (охлаждение): иначе выключенный модуль продолжал бы давить/держать частоту окна игры.
+        if (!winRate_ || !g_cfg.enable || !g_cfg.panel_game_vote || effPanelHz() <= 0) return;
         ANativeWindow* w = nullptr;
         { std::lock_guard<std::mutex> g(sc_m_); w = win_; if (w) ANativeWindow_acquire(w); }
         if (w) { winRate_(w, (float)effPanelHz(), 0, 1); ANativeWindow_release(w); }
