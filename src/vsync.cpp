@@ -107,10 +107,14 @@ int64_t Vsync::nextVsyncAfter(int64_t now_ns) const {
     int64_t origin = impl_ ? impl_->grid_origin.load(std::memory_order_relaxed) : 0;
     int64_t p      = impl_ ? impl_->grid_period.load(std::memory_order_relaxed) : 16666667;
     if (!origin || p <= 0) return now_ns + p / 2;   // сетка не набрана — грубая оценка
-    if (now_ns <= origin) return origin + p;
-    // Сколько целых периодов помещается между опорной точкой и now: сетка не сдвигается.
-    int64_t k = (now_ns - origin + p - 1) / p;      // ceil
-    return origin + k * p;
+    // Сетка vsync-ов: origin + m*p для целых m (origin — реальный тик). Ищем ближайшую
+    // точку СТРОГО ПОСЛЕ now: m = floor((now - origin)/p) + 1. Прежний код при now <= origin
+    // всегда возвращал origin + p, хотя если latch попадает между origin-p и origin,
+    // следующим vsync-ом является сам origin — оценка present уезжала на целый период,
+    // и этот шум заходил в контур пейсинга (err в слотах).
+    const int64_t diff = now_ns - origin;
+    const int64_t m = diff >= 0 ? diff / p : -((-diff + p - 1) / p);   // floor-деление
+    return origin + (m + 1) * p;
 }
 
 bool Vsync::start(Callback cb, void* user) {

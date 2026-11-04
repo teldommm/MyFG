@@ -128,6 +128,7 @@ void record(void* self, int slot, void* buf) {
         e->self = self;
     }
     e->buf[slot] = buf;
+    e->last_ns = now_ns();     // LRU: и для существующего producer'а (lookup не зовётся, когда кадры идут через Surface-хук)
 }
 
 void* lookup(void* self, int slot) {

@@ -99,6 +99,7 @@ void Config::sanitize() {
     clampi(me_refine, 0, 2);
     clampi(me_dy_sign, 0, 2);
     clampi(pacing, 0, 1);
+    if (target_w == 0 || target_h == 0) { target_w = 0; target_h = 0; }   // только пара — иначе размер не задан
 }
 
 // Поля, которые читаются на каждом кадре и поэтому безопасно меняются в работе. Хуки, выбор очереди
@@ -110,5 +111,8 @@ void Config::applyLive(const Config& n) {
     L(multiplier) L(dup_detect) L(dup_thresh) L(use_oncomplete) L(layer_tf) L(hdr) L(hdr_pw) L(hdr_peak) L(hdr_knee) L(hdr_boost) L(hdr_gamma) L(hdr_ct) L(hdr_sat) L(adaptive) L(gpu_budget)
     L(thermal) L(thermal_hi) L(thermal_lo) L(thermal_hz) L(debug) L(hud) L(hud_mode) L(hud_pos) L(hud_scale) L(hud_tf)
     L(pts_phase) L(qcom_me) L(me_refine) L(me_dy_sign) L(pacing)
+    // Читаются на каждом кадре (elect()/blast_hint()), поэтому безопасно меняются на ходу.
+    // Прежде live-правка target_w/target_h/elect_blast молча не действовала до рестарта игры.
+    L(target_w) L(target_h) L(elect_blast)
 #undef L
 }

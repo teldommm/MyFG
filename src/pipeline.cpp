@@ -144,8 +144,9 @@ private:
             // терялся самый старый кадр, в том числе реальный. Сгенерированный кадр, опоздавший больше
             // чем на 1.5 периода, показывать уже поздно: выбрасываем его, реальные кадры не трогаем.
             {
-                const int64_t nowc = now_ns();
-                while (on_ > 1 && !oq_[0].real && nowc - oq_[0].target_ns > vi.period_ns * 3 / 2) {
+                // now_ns() берём на каждой итерации: за время выбрасывания нескольких
+                // устаревших кадров время уходит, и «сейчас» не должно застревать на входе в цикл
+                while (on_ > 1 && !oq_[0].real && now_ns() - oq_[0].target_ns > vi.period_ns * 3 / 2) {
                     oq_[0].drop();
                     for (int i = 1; i < on_; i++) oq_[i - 1] = oq_[i];
                     on_--;
@@ -272,6 +273,10 @@ private:
     }
 
     void apply(OutItem& it, const int64_t* vsync_id, int64_t desired_ns = 0) {
+        // Модуль выключили на ходу, а этот кадр уже забран из очереди заблаговременно:
+        // не показываем его поверх спрятанного оверлея (vsync-поток встаёт на паузу и
+        // никто не спрятал бы его повторно).
+        if (!g_cfg.enable) { it.drop(); return; }
         // Кадр из прежнего кольца (кольцо пересоздано, пока он ждал своего vsync): показывать
         // нельзя, а слот уже принадлежит новому поколению — отпускаем буфер, не касаясь слота
         // (drop() здесь нельзя: он обнулил бы hold чужого слота).
@@ -302,7 +307,11 @@ private:
         ASurfaceTransaction_setBufferTransparency(t, sc_, ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
         // transform слоя: из QueueBufferInput или принудительный (layer_tf 0..7)
         const uint32_t tf = g_cfg.layer_tf >= 0 ? (uint32_t)g_cfg.layer_tf : it.transform;
-        int ww = win_w_, wh = win_h_;
+        // Размер окна спрашиваем у окна ЗДЕСЬ (под sc_m_): кэш win_w_/win_h_ обновляется
+        // только разметкой раз в секунду (housekeeping), и после поворота/ресайза оверлей
+        // до секунды растягивался бы по старой геометрии.
+        int ww = 0, wh = 0;
+        if (win_) { ww = ANativeWindow_getWidth(win_); wh = ANativeWindow_getHeight(win_); }
         if (ww <= 0 || wh <= 0) { ww = it.w; wh = it.h; if (tf & 4) { int x = ww; ww = wh; wh = x; } }
         ARect src = {0, 0, it.w, it.h};
         ARect dst = {0, 0, ww, wh};
@@ -366,6 +375,20 @@ private:
         if (hidden_cnt_ <= 3 || g_cfg.debug) LOGI("overlay hidden (%s): the game layer is visible", req ? "real frame lost" : "no frames from the game");
     }
 
+    // Прячет оверлей с текущего потока (idle() зовёт vsync-поток). Нужно при выключении на ходу:
+    // vsync вот-вот встанет на паузу, и hide_req_ может остаться необработанным — тогда поверх
+    // живой игры остался бы последний показанный кадр.
+    void hideNow() {
+        std::lock_guard<std::mutex> g(sc_m_);
+        if (!sc_ || !visible_.load()) return;
+        ASurfaceTransaction* t = ASurfaceTransaction_create();
+        ASurfaceTransaction_setVisibility(t, sc_, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+        ASurfaceTransaction_apply(t);
+        ASurfaceTransaction_delete(t);
+        visible_.store(false);
+        hidden_cnt_++;
+    }
+
     void push(OutItem& it) {
         std::lock_guard<std::mutex> g(oq_m_);
         if (on_ == kQ) {
@@ -400,10 +423,13 @@ private:
         if (w == win_) { ANativeWindow_release(w); refreshWinSize(); return true; }
         ASurfaceControl* sc = ASurfaceControl_createFromWindow(w, "myfg_overlay");
         if (!sc) {
-            LOGW("ASurfaceControl_createFromWindow failed for %p (%dx%d)", w, ANativeWindow_getWidth(w), ANativeWindow_getHeight(w));
+            if (sc_fail_cnt_ < 3 || g_cfg.debug)      // housekeeping зовёт раз в секунду: не заливаем лог
+                LOGW("ASurfaceControl_createFromWindow failed for %p (%dx%d)", w, ANativeWindow_getWidth(w), ANativeWindow_getHeight(w));
+            sc_fail_cnt_++;
             ANativeWindow_release(w);
             return false;
         }
+        sc_fail_cnt_ = 0;
         ASurfaceControl* old; ANativeWindow* oldw;
         {
             std::lock_guard<std::mutex> g(sc_m_);
@@ -1110,19 +1136,21 @@ private:
         const bool en = g_cfg.enable != 0;
         if (en != enabled_) {
             enabled_ = en;
-            vsync_.pause(!en);                     // пока выключено, не просыпаться на каждый vsync
-            LOGI(en ? "frame generation resumed (enabled in settings)" : "frame generation paused (disabled in settings)");
             if (!en) {
                 clearQueue();
-                hide_req_.store(true);                 // vsync-поток спрячет оверлей: виден живой слой игры
+                hide_req_.store(true);      // зайдёт ещё vsync-колбэк — пусть спрячет оверлей и он
+                hideNow();                  // но после паузы он может не зайти вовсе: прячем сами
                 want_rate_.store(0.0f);
-                src_ema_ = 0.0; src_n_ = 0; lastTs_ = 0; lastPts_ = 0; lamValid_ = false; plan_last_ = -1; plan_stable_ = 0;
+                src_ema_ = 0.0; src_n_ = 0; lastTs_ = 0; lastPts_ = 0; lastPtsValid_ = false;
+                lamValid_ = false; plan_last_ = -1; plan_stable_ = 0;
                 if (winRate_) {                        // снять голос частоты с окна игры
                     ANativeWindow* w = nullptr;
                     { std::lock_guard<std::mutex> g(sc_m_); w = win_; if (w) ANativeWindow_acquire(w); }
                     if (w) { winRate_(w, 0.0f, 0, 1); ANativeWindow_release(w); }
                 }
             }
+            vsync_.pause(!en);             // паузу ставим, когда оверлей уже гарантированно спрятан
+            LOGI(en ? "frame generation resumed (enabled in settings)" : "frame generation paused (disabled in settings)");
         }
         if (!en) {
             anchor_run_.store(false);
@@ -1182,6 +1210,10 @@ private:
             winRate_ = (PFN_winRate)dlsym(h, "ANativeWindow_setFrameRateWithChangeStrategy");
             if (!winRate_) winRate_ = (PFN_winRate)dlsym(h, "ANativeWindow_setFrameRate");
         }
+        // panel_hz/display_fps/auto_rate молча не работают, если точек входа нет (старый Android):
+        // пользователь должен увидеть в логе, почему голос частоты не действует.
+        if (!setFrameRate_ && !winRate_ && (g_cfg.panel_hz > 0 || g_cfg.display_fps > 0 || g_cfg.auto_rate))
+            LOGW("frame rate hints are ignored: setFrameRate entry points not found (old Android?)");
         fallback::markOwnThread();              // vkCreateDevice модуля не должен проходить через хук запасного пути
         getId_ = (PFN_getId)dlsym(RTLD_DEFAULT, "AHardwareBuffer_getId");
 
@@ -1213,6 +1245,8 @@ private:
         LOGI("pipeline up");
 
         last_check_ = now_ns();
+        stat_t_ = last_check_;      // иначе первый интервал статистики считался бы от epoch (stat_t_=0)
+                                    // и первая строка выходила с мусорными "0.0/s" / ложным idle
         for (;;) {
             capture::Job j;
             if (!capture::pop(&j, 100)) { housekeeping(); printStats(); continue; }
@@ -1271,15 +1305,16 @@ private:
         //   3) сброс λ при скачке > 60 мс (seek в видео, смена источника): фильтр не тянет разрыв.
         // Якорь зажат сверху моментом now: ошибка λ не может отложить кадры в будущее —
         // худший случай вырождается в якорь = момент прибытия.
-        const int64_t pts = j.pts_ns > 0 ? j.pts_ns : ts;
-        const bool havePts = g_cfg.pts_phase && j.pts_ns > 0 && lastPts_ > 0;
+        // lastPts_ имеет смысл считать интервалом, только если оно тоже получено из PTS:
+        // иначе D смешивает опорные часы (медиа-время и CLOCK_MONOTONIC) и сдвигает якорь фазы.
+        const bool havePts = g_cfg.pts_phase && j.pts_ns > 0 && lastPts_ > 0 && lastPtsValid_;
         if (!j.pts_ns) ptsFallback_++;
         if (lamSamples_ == 30)                      // раз в жизнь потока: чем реально anchors
             LOGI("pts-phase: anchor from source PTS (λ=%+.1f ms, resets=%d)%s", lamEma_ / 1.0e6, lamResets_,
                  ptsFallback_ ? " — some frames carry no PTS" : "");
         int64_t D = 0;
         if (havePts) {
-            D = pts - lastPts_;
+            D = j.pts_ns - lastPts_;
             if (!(D > 1000000LL && D <= (int64_t)g_cfg.max_dt_ms * 2000000LL)) D = 0;   // не похож на интервал — откат
         }
         const int64_t dtPts = D ? D : dt;                       // шаг блока вывода
@@ -1290,7 +1325,8 @@ private:
             const int64_t anchored = j.pts_ns + (int64_t)lamEma_;
             if (anchored < base) base = anchored;                // λ-ошибка не откладывает кадры в будущее
         }
-        lastPts_ = pts;
+        if (j.pts_ns > 0) { lastPts_ = j.pts_ns; lastPtsValid_ = true; }
+        else lastPtsValid_ = false;      // кадр без метки: следующему с PTS нельзя считать D от этого
         lastTs_ = ts;
         frames_++;
         if (frames_ == 1) LOGI("first game frame: %ux%u transform=%u dataspace=0x%x", w, h, (unsigned)j.transform, (unsigned)j.dataspace);
@@ -1627,8 +1663,10 @@ private:
         frIdx_ = (frIdx_ + 1) % kFrames;
 
         int fd = vk_.can_export_syncfd ? vk_.exportSyncFd(fr.sig_sem) : -1;
-        if (fd < 0 && !vk_.can_export_syncfd) {                  // без sync_fd: ждём на CPU
+        if (fd < 0) {                                             // нет sync_fd: ждём на CPU
             // Кадр уходит в очередь без fence: SF скомпозитит буфер — он должен быть готов.
+            // Сюда попадаем и при РАЗОВОМ сбое экспорта (can_export_syncd есть, но fd
+            // не получился): недописанный буфер нельзя отдавать и в этом случае.
             // При таймауте дожидаемся конца исполнения, а не отдаём недописанный буфер.
             if (vk_.f.WaitForFences(vk_.dev, 1, &fr.fence, VK_TRUE, 100000000ull) == VK_TIMEOUT)
                 vk_.f.DeviceWaitIdle(vk_.dev);
@@ -1758,6 +1796,7 @@ private:
     int64_t lastTs_ = 0;
     // ---- фаза от меток источника
     int64_t lastPts_ = 0;
+    bool lastPtsValid_ = false;       // lastPts_ — действительно PTS источника (не момент прибытия)
     double lamEma_ = 0.0;             // EMA (готовность блока - pts): сдвиг опорных часов + латентность конвейера
     bool lamValid_ = false;
     int lamResets_ = 0, lamSamples_ = 0;
@@ -1795,6 +1834,7 @@ private:
     int64_t last_check_ = 0;
     int ringMaxGen_ = 0;
     std::atomic<bool> anchor_run_{false}, anchor_alive_{false};
+    int sc_fail_cnt_ = 0;                     // подряд неудачных созданий слоя (лог не заливаем)
     std::mutex anchor_m_;
     bool enabled_ = true;                       // последнее наблюдённое значение enable (для логов пауза/возобновление)
     // детектор повторов

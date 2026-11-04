@@ -678,8 +678,9 @@ function resetBtn(k) {
 const iconBox = ic => h('span', { class: 'tu-row-icon', text: ic });
 // Ключи, которые игра читает только при запуске (хуки, очередь, создание устройства): в live-обновление
 // не входят (Config::applyLive в config.cpp). Под такими настройками показывается пометка.
+// target_w/target_h/elect_blast читаются на каждом кадре и применяются на ходу (см. applyLive).
 const RESTART_KEYS = new Set(['hook_surface', 'hook_egl', 'hook_anw', 'hook_vk', 'hook_swap', 'hook_present', 'hook_delay_ms',
-  'fallback_ms', 'elect_blast', 'queue_prio', 'target_w', 'target_h']);
+  'fallback_ms', 'queue_prio']);
 const textBox = (label, desc) => {
   const dk = label && label.dataset ? label.dataset.i18n : '';
   const key = dk && dk.startsWith('k_') ? dk.slice(2) : '';

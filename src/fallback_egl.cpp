@@ -167,9 +167,19 @@ bool build_ring_locked(EGLDisplay d, EGLContext ctx, int w, int h) {
     g_ring.es3 = ver >= 3 && F.BlitFramebuffer && F.ReadBuffer;
     if (!g_ring.es3 && !F.CopyTexSubImage2D) return false;
 
-    GLint prevTex = 0, prevFbo = 0;
+    // ES3: READ и DRAW framebuffer — независимые точки привязки. Биндим/восстанавливаем обе
+    // по отдельности: единый GL_FRAMEBUFFER в этой версии затирал бы READ-биндинг игры
+    // (glBindFramebuffer(GL_FRAMEBUFFER, ...) меняет оба, а сохранялся только DRAW).
+    GLint prevTex = 0, prevRead = 0, prevDraw = 0;
     F.GetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
-    F.GetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+    if (g_ring.es3) {
+        F.GetIntegerv(0x8CAA /*GL_READ_FRAMEBUFFER_BINDING*/, &prevRead);
+        F.GetIntegerv(0x8CA6 /*GL_DRAW_FRAMEBUFFER_BINDING*/, &prevDraw);
+    } else {
+        F.GetIntegerv(GL_FRAMEBUFFER_BINDING, &prevDraw);
+        prevRead = prevDraw;
+    }
+    const GLenum fboT = g_ring.es3 ? 0x8CA9 /*GL_DRAW_FRAMEBUFFER*/ : GL_FRAMEBUFFER;
     bool ok = true;
     for (int i = 0; i < kN && ok; i++) {
         Slot& s = g_ring.s[i];
@@ -186,12 +196,17 @@ bool build_ring_locked(EGLDisplay d, EGLContext ctx, int w, int h) {
         F.BindTexture(GL_TEXTURE_2D, s.tex);
         F.ImageTargetTex(GL_TEXTURE_2D, (GLeglImageOES)s.img);
         F.GenFramebuffers(1, &s.fbo);
-        F.BindFramebuffer(GL_FRAMEBUFFER, s.fbo);
-        F.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s.tex, 0);
-        if (F.CheckFramebufferStatus && F.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) ok = false;
+        F.BindFramebuffer(fboT, s.fbo);
+        F.FramebufferTexture2D(fboT, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s.tex, 0);
+        if (F.CheckFramebufferStatus && F.CheckFramebufferStatus(fboT) != GL_FRAMEBUFFER_COMPLETE) ok = false;
     }
     F.BindTexture(GL_TEXTURE_2D, (GLuint)prevTex);
-    F.BindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+    if (g_ring.es3) {
+        F.BindFramebuffer(0x8CA8 /*GL_READ_FRAMEBUFFER*/, (GLuint)prevRead);
+        F.BindFramebuffer(0x8CA9 /*GL_DRAW_FRAMEBUFFER*/, (GLuint)prevDraw);
+    } else {
+        F.BindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevDraw);
+    }
     g_ring.dpy = d; g_ring.ctx = ctx; g_ring.w = w; g_ring.h = h;
     g_ring.valid = ok;
     if (!ok) { LOGW("egl fallback: ring %dx%d could not be built", w, h); destroy_ring_locked(); }

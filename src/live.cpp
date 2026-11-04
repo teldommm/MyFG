@@ -44,7 +44,10 @@ void start(const char* package, void (*on_applied)()) {
             D(release_lag) D(stats) D(max_gen) D(target_fps) D(flow_side) D(panel_hz) D(panel_game_vote) D(panel_anchor)
             D(multiplier) D(dup_detect) D(dup_thresh) D(use_oncomplete) D(layer_tf) D(hdr) D(hdr_pw) D(hdr_peak) D(hdr_knee) D(hdr_boost) D(hdr_gamma) D(hdr_ct) D(hdr_sat) D(adaptive)
             D(gpu_budget) D(debug) D(hud) D(hud_mode) D(hud_pos) D(hud_scale) D(hud_tf)
+            D(thermal) D(thermal_hi) D(thermal_lo) D(thermal_hz)
+            D(pts_phase) D(qcom_me) D(me_refine) D(me_dy_sign)
             D(pacing)
+            D(target_w) D(target_h) D(elect_blast)
 #undef D
             if (!diff.empty()) LOGI("settings changed:%s", diff.c_str());
             if (on_applied) on_applied();
