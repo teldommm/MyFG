@@ -1,0 +1,6 @@
+build/
+third_party/Dobby/
+third_party/Dobby.tmp/
+myfg-module.zip
+__pycache__/
+build-ndk/

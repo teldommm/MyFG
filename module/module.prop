@@ -1,0 +1,6 @@
+id=myfg
+name=MyFG
+version=v0.22
+versionCode=22
+author=@teldommm
+description=Zygisk frame generation (BufferQueue capture + WFG optical flow + ASurfaceControl overlay). Stage 1-3 from OpenFG: PTS-phase interpolation, QCOM hardware ME with half-res GPU field refinement (OpenFG refine pass), split submits (blit goes to the GPU before the blocking ME readback), Y-sign self-test and me=used/dropped stats; battery thermal throttling. Settings via WebUI, stored in the module directory. Requires Zygisk.

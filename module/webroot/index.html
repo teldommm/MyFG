@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#121212">
+  <title>MyFG</title>
+  <link href="style.css" rel="stylesheet">
+  <script src="script.js" defer></script>
+</head>
+<body>
+
+<div id="splash" class="tu-splash" aria-hidden="true"><div class="tu-spinner"></div></div>
+
+<div id="app" class="hidden">
+
+<!-- ═══ HEADER ═══════════════════════════════════════════════════════════ -->
+<header class="tu-header">
+  <div class="tu-header-inner">
+    <div class="tu-logo-wrap">
+      <svg class="tu-logo" viewBox="0 0 46 46" aria-hidden="true">
+        <rect x="9" y="12" width="12" height="22" rx="3" fill="none" stroke="#02d98d" stroke-width="2.4"/>
+        <rect x="25" y="12" width="12" height="22" rx="3" fill="#02d98d" fill-opacity=".25" stroke="#02d98d" stroke-width="2.4" stroke-dasharray="3.2 2.6"/>
+        <path d="M21.5 23h3" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/>
+      </svg>
+    </div>
+    <div class="tu-header-text">
+      <h1 class="tu-title">MyFG</h1>
+      <span id="moduleVer" class="tu-ver"></span>
+    </div>
+    <div id="statusBadge" class="tu-header-badge">
+      <span class="tu-badge-dot"></span>
+      <span id="statusLabel" class="tu-badge-label"></span>
+    </div>
+  </div>
+</header>
+
+<!-- ═══ MAIN ══════════════════════════════════════════════════════════════ -->
+<main>
+
+  <!-- Какой профиль редактируем -->
+  <section class="tu-card" id="scopeCard">
+    <div class="tu-card-header">
+      <span class="tu-card-icon">🎯</span>
+      <h2 class="tu-card-title" data-i18n="scope"></h2>
+    </div>
+    <div class="tu-scope">
+      <div class="tu-controls">
+        <select id="scopeSel" class="tu-select" data-i18n-aria="scope"></select>
+        <button id="restartBtn" class="tu-btn tu-btn-green hidden" type="button" data-i18n="restartGame"></button>
+      </div>
+    </div>
+    <p id="scopeNote" class="tu-card-note"></p>
+  </section>
+
+  <!-- Карточки настроек строятся из схемы в script.js -->
+  <div id="settings"></div>
+
+  <!-- Игры -->
+  <section class="tu-card" id="appsCard">
+    <div class="tu-card-header">
+      <span class="tu-card-icon">🎮</span>
+      <h2 class="tu-card-title" data-i18n="games"></h2>
+    </div>
+    <div id="pkgList"></div>
+    <div class="tu-pkg-add">
+      <div class="tu-controls">
+        <input id="pkgInput" class="tu-text-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+               data-i18n-ph="phPackage">
+        <button id="pkgAddBtn" class="tu-btn tu-btn-accent" type="button" data-i18n="add"></button>
+      </div>
+      <button id="pkgPickBtn" class="tu-btn tu-btn-green w-full" type="button" data-i18n="pickInstalled"></button>
+    </div>
+    <p class="tu-card-note" data-i18n="gamesNote"></p>
+  </section>
+
+  <!-- Метрики и лог -->
+  <section class="tu-card" id="logCard">
+    <div class="tu-card-header">
+      <span class="tu-card-icon">📈</span>
+      <h2 class="tu-card-title" data-i18n="status"></h2>
+    </div>
+    <p id="logState" class="tu-card-note"></p>
+    <div id="chips" class="tu-chips"></div>
+    <pre id="logBox" class="tu-log"></pre>
+    <div class="tu-log-actions">
+      <button id="logRefreshBtn" class="tu-btn tu-btn-accent" type="button" data-i18n="refresh"></button>
+      <button id="logAutoBtn" class="tu-btn" type="button" data-i18n="autoRefresh" aria-pressed="false"></button>
+      <button id="logCopyBtn" class="tu-btn" type="button" data-i18n="copy"></button>
+    </div>
+  </section>
+
+</main>
+
+<!-- ═══ FOOTER ════════════════════════════════════════════════════════════ -->
+<footer class="tu-footer">
+  <a href="https://github.com/teldommm" target="_blank" rel="noopener noreferrer" class="tu-footer-link">GitHub</a>
+  <span class="tu-footer-sep">·</span>
+  <button id="licenseBtn" class="tu-footer-link" type="button">License GPL 3.0</button>
+  <span class="tu-footer-sep">·</span>
+  <span class="tu-footer-link tu-footer-static">© 2026</span>
+  <span class="tu-lang" role="group" aria-label="Language">
+    <button type="button" class="tu-lang-btn" data-lang="ru">RU</button>
+    <button type="button" class="tu-lang-btn" data-lang="en">EN</button>
+  </span>
+</footer>
+
+</div><!-- /#app -->
+
+<!-- ═══ Выбор игр из установленных приложений ═════════════════════════════ -->
+<div id="pickerModal" class="tu-gate tu-sheet hidden">
+  <div class="tu-sheet-head">
+    <h2 class="tu-gate-title" data-i18n="pickTitle"></h2>
+    <p class="tu-gate-hint" data-i18n="pickHint"></p>
+  </div>
+  <input id="pickSearch" class="tu-text-input" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"
+         data-i18n-ph="phSearch">
+  <div id="pickList" class="tu-file-list"></div>
+  <div class="tu-sheet-foot">
+    <div class="tu-confirm-row">
+      <button id="pickApplyBtn" class="tu-btn tu-btn-accent flex-1" type="button" data-i18n="addSelected"></button>
+      <button id="pickCloseBtn" class="tu-btn flex-1" type="button" data-i18n="close"></button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══ Лицензия ══════════════════════════════════════════════════════════ -->
+<div id="licenseModal" class="tu-gate tu-sheet hidden" role="dialog" aria-modal="true" aria-labelledby="licenseTitle">
+  <div class="tu-sheet-head">
+    <h2 id="licenseTitle" class="tu-gate-title">GNU General Public License v3.0</h2>
+    <p class="tu-gate-hint" data-i18n="licenseHint"></p>
+  </div>
+  <pre id="licenseText" class="tu-license-text" tabindex="0"></pre>
+  <div class="tu-sheet-foot">
+    <button id="licenseCloseBtn" class="tu-btn tu-btn-accent w-full" type="button" data-i18n="close"></button>
+  </div>
+</div>
+
+<div id="toast" class="tu-toast" role="status" aria-live="polite"></div>
+
+</body>
+</html>
