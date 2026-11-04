@@ -1283,15 +1283,8 @@ private:
             if (!(D > 1000000LL && D <= (int64_t)g_cfg.max_dt_ms * 2000000LL)) D = 0;   // не похож на интервал — откат
         }
         const int64_t dtPts = D ? D : dt;                       // шаг блока вывода
-        if (j.pts_ns > 0) {
-            const int64_t lam = ts - j.pts_ns;                   // скольжение метка→прибытие
-            if (!lamValid_) { lamEma_ = (double)lam; lamValid_ = true; }
-            else if (llabs(lam - (int64_t)lamEma_) > 60000000LL) {   // скачок: seek/смена источника
-                if (lamResets_ < 8) LOGD("pts-phase: clock jump %+lld ms, resetting", (long long)(lam - (int64_t)lamEma_) / 1000000);
-                lamEma_ = (double)lam; lamResets_++;
-            } else lamEma_ += (double)(lam - lamEma_) * 0.20;    // τ ≈ 5 кадров на 30 fps
-            lamSamples_++;
-        }
+        // λ обновляется в точке вывода (после submit, см. «очередь вывода»): якорь должен
+        // поглощать латентность всего конвейера, а не только захвата.
         int64_t base = now_ns();
         if (lamValid_ && j.pts_ns > 0 && g_cfg.pts_phase) {
             const int64_t anchored = j.pts_ns + (int64_t)lamEma_;
@@ -1644,6 +1637,22 @@ private:
         // --- очередь вывода -----------------------------------------------------------------
         // base/dtPts — из фазового блока выше: якорь от метки источника + λ-фильтр, шаг по PTS.
         const int64_t base_out = base;
+        // P0-fix: λ считается в ТОЧКЕ ВЫВОДА (после submit), а не в точке захвата.
+        // Раньше λ = ts - pts ≈ 0 у игр (метка = момент queueBuffer), и якорь base = pts
+        // оказывался в прошлом на величину латентности конвейера (import/ME/GPU submit,
+        // 5-20 мс). При 60 fps шаг блока 8.3 мс < латентности: цель gen-кадра (base)
+        // постоянно в прошлом, «догон» (dropLate > 1.5 периода) выкидывал gen-кадры
+        // вразнобой — итоговый FPS плавал вместо 120. Теперь λ поглощает всю латентность:
+        // base = pts + λ ≈ момент готовности блока, цель gen-кадра снова в будущем.
+        if (j.pts_ns > 0) {
+            const int64_t lam = now_ns() - j.pts_ns;             // метка источника → готовность блока к показу
+            if (!lamValid_) { lamEma_ = (double)lam; lamValid_ = true; }
+            else if (llabs(lam - (int64_t)lamEma_) > 60000000LL) {   // скачок: seek/смена источника
+                if (lamResets_ < 8) LOGD("pts-phase: clock jump %+lld ms, resetting", (long long)(lam - (int64_t)lamEma_) / 1000000);
+                lamEma_ = (double)lam; lamResets_++;
+            } else lamEma_ += (double)(lam - lamEma_) * 0.20;    // τ ≈ 5 кадров на 30 fps
+            lamSamples_++;
+        }
         const uint64_t rg = ringGen_.load();          // поколение кольца этих слотов
         for (uint32_t g = 0; g < planned; g++) {
             OutItem it;
@@ -1749,7 +1758,7 @@ private:
     int64_t lastTs_ = 0;
     // ---- фаза от меток источника
     int64_t lastPts_ = 0;
-    double lamEma_ = 0.0;             // EMA (ts - pts): сдвиг опорных часов + латентность захвата
+    double lamEma_ = 0.0;             // EMA (готовность блока - pts): сдвиг опорных часов + латентность конвейера
     bool lamValid_ = false;
     int lamResets_ = 0, lamSamples_ = 0;
     uint64_t ptsFallback_ = 0;        // кадров без валидной метки (для отладочного лога)
