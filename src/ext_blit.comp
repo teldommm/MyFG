@@ -1,0 +1,14 @@
+#version 450
+// Копирование буфера с внешним форматом (vendor/UBWC, vkFormat=UNDEFINED) в обычный RGBA8 storage-образ.
+// Чтение идёт через immutable-сэмплер с VkSamplerYcbcrConversion (externalFormat), crop применяется здесь.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D uSrc;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D uDst;
+layout(push_constant) uniform P { ivec4 crop; ivec2 srcSize; ivec2 dstSize; } p;
+void main() {
+    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (g.x >= p.dstSize.x || g.y >= p.dstSize.y) return;
+    vec2 span = vec2(p.crop.zw - p.crop.xy);
+    vec2 uv = (vec2(p.crop.xy) + (vec2(g) + 0.5) * span / vec2(p.dstSize)) / vec2(p.srcSize);
+    imageStore(uDst, g, textureLod(uSrc, uv, 0.0));
+}

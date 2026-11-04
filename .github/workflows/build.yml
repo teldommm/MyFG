@@ -1,0 +1,14 @@
+name: build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with: { ndk-version: r27c }
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build zip
+      - run: ANDROID_NDK_HOME=${{ steps.ndk.outputs.ndk-path }} ./build.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: myfg-module, path: myfg-module.zip }
