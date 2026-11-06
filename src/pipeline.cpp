@@ -858,14 +858,17 @@ private:
 
     // =============================================================== детектор повторных кадров
     // Игра может постить 60 к/с при 30 уникальных. Такие кадры нельзя считать источником: WFG видел бы 60 fps
-    // и ничего не генерировал. Берём уменьшенную копию кадра (64x36, blit с LINEAR) в host-буфер и сравниваем
-    // со следующим; повтор пропускаем целиком (интервал dt считается между уникальными кадрами).
+    // и ничего не генерировал. Берём уменьшенную копию кадра (128x72, blit с LINEAR) в host-буфер и сравниваем
+    // со следующим по ДВУМ критериям: средняя разность по всему кадру (глобальный шум: TAA-jitter, дизеринг)
+    // и сумма разности худшего блока 8x6 текселей (локальное движение: курсор, миникарта, счётчик —
+    // раньше растворялось в среднем и кадр терялся). Повтор пропускаем целиком (интервал dt считается
+    // между уникальными кадрами).
     // Цена: один короткий submit и ожидание его на CPU на каждый кадр, поэтому опция выключена по умолчанию.
-    static constexpr uint32_t kSigW = 64, kSigH = 36;
+    static constexpr uint32_t kSigW = 128, kSigH = 72;
 
     bool ensureSig() {
+        if (sigFail_) return false;          // в т.ч. runtime-отключение после таймаута fence (см. isDuplicate)
         if (sigReady_) return true;
-        if (sigFail_) return false;
         sigFail_ = true;
         VkImageCreateInfo ici{};
         ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -924,7 +927,10 @@ private:
             if (!dupExtWarned_) { dupExtWarned_ = true; LOGW("dup_detect unavailable: the game buffer has an external (YCbCr) format"); }
             return false;
         }
-        if (!ensureSig()) return false;
+        if (!ensureSig()) {
+            if (!dupSigWarned_) { dupSigWarned_ = true; LOGW("dup_detect disabled: init failed or signature fence timeout earlier"); }
+            return false;
+        }
         const uint32_t FOREIGN = VK_QUEUE_FAMILY_FOREIGN_EXT, Q = vk_.qfam;
         int fd2 = j.fence_fd >= 0 ? dup(j.fence_fd) : -1;
         bool gpuWait = false;
@@ -967,10 +973,21 @@ private:
         si.waitSemaphoreCount = gpuWait ? 1 : 0; si.pWaitSemaphores = &sigSem_; si.pWaitDstStageMask = &wst;
         si.commandBufferCount = 1; si.pCommandBuffers = &cb;
         if (vk_.f.QueueSubmit(vk_.queue, 1, &si, sigFence_) != VK_SUCCESS) return false;
+        // Ожидание «с таймаутом и забыть» — путь к UB: submit ещё исполняется, а на следующем кадре
+        // sigCb_ уйдёт в ResetCommandBuffer в состоянии pending и два submit'а начнут писать sigBuf_
+        // одновременно. Поэтому: 50 мс -> ещё 5 с (GPU перегружен) -> детектор выключается навсегда,
+        // но cb больше не трогаем (fail-open: все кадры дальше — уникальные).
         VkResult wr = vk_.f.WaitForFences(vk_.dev, 1, &sigFence_, VK_TRUE, 50000000ull);
-        if (wr != VK_SUCCESS) wr = vk_.f.WaitForFences(vk_.dev, 1, &sigFence_, VK_TRUE, 500000000ull);
+        if (wr != VK_SUCCESS) {
+            LOGW("dup detector: signature not ready in 50 ms (GPU busy or hung?), waiting up to 5 s");
+            wr = vk_.f.WaitForFences(vk_.dev, 1, &sigFence_, VK_TRUE, 5000000000ull);
+        }
         vk_.f.ResetFences(vk_.dev, 1, &sigFence_);
-        if (wr != VK_SUCCESS) return false;
+        if (wr != VK_SUCCESS) {
+            LOGW("dup detector: fence not signaled in 5 s — detector disabled for this process");
+            sigFail_ = true;               // cb может ещё висеть в очереди: никогда его больше не используем
+            return false;
+        }
         if (!sigCoherent_) {
             VkMappedMemoryRange mr{};
             mr.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE; mr.memory = sigBufMem_; mr.offset = 0; mr.size = VK_WHOLE_SIZE;
@@ -978,15 +995,41 @@ private:
         }
         const size_t n = (size_t)kSigW * kSigH * 4;
         bool dup = false;
+        // Сменился кроп/разрешение — prevSig_ снята с другой области кадра и несравнима: начинаем заново.
+        if (prevValid_ && (j.cl != sigCl_ || j.ct != sigCt_ || j.cr != sigCr_ || j.cb != sigCb_))
+            prevValid_ = false;
         if (prevValid_) {
+            // Два критерия, повтор — только если тихи ОБА:
+            //  1) средняя разность по кадру (dup_thresh) — глобальный мелкий шум всего экрана;
+            //  2) худший блок 8x6 текселей (kBlkMax) — локальное движение. Блок = 48 текселей x 3 канала
+            //     = 144 отсчёта; 1024 ~ «7 единиц разности на отсчёт»: одиночный шумовой пик TAA
+            //     (<=765) терпим, компактное изменение в 2+ текселях — уже уникальный кадр.
+            //     Ошибка возможна только в «уникальный» (безопасная сторона): пропускать реальные
+            //     кадры детектор больше не может.
+            static constexpr uint32_t BW = 8, BH = 6, NB = (kSigW / BW) * (kSigH / BH), kBlkMax = 1024;
             uint64_t sum = 0;
-            for (size_t i = 0; i < n; i += 4)
-                sum += (uint64_t)abs((int)sigMap_[i] - prevSig_[i]) + (uint64_t)abs((int)sigMap_[i + 1] - prevSig_[i + 1]) +
-                       (uint64_t)abs((int)sigMap_[i + 2] - prevSig_[i + 2]);
+            uint32_t blk[NB] = {};
+            for (uint32_t y = 0; y < kSigH; y++) {
+                uint32_t* brow = blk + (size_t)(y / BH) * (kSigW / BW);
+                for (uint32_t x = 0; x < kSigW; x++) {
+                    const size_t i = ((size_t)y * kSigW + x) * 4;
+                    const uint32_t d = (uint32_t)abs((int)sigMap_[i] - prevSig_[i]) +
+                                       (uint32_t)abs((int)sigMap_[i + 1] - prevSig_[i + 1]) +
+                                       (uint32_t)abs((int)sigMap_[i + 2] - prevSig_[i + 2]);
+                    sum += d;
+                    brow[x / BW] += d;
+                }
+            }
             const double mean = (double)sum / ((double)kSigW * kSigH * 3.0);
-            dup = mean <= (double)g_cfg.dup_thresh;
+            uint32_t blkMax = 0;
+            for (uint32_t b = 0; b < NB; b++) blkMax = std::max(blkMax, blk[b]);
+            dup = mean <= (double)g_cfg.dup_thresh && blkMax <= kBlkMax;
         }
-        if (!dup) { memcpy(prevSig_.data(), sigMap_, n); prevValid_ = true; }
+        if (!dup) {
+            memcpy(prevSig_.data(), sigMap_, n);
+            prevValid_ = true;
+            sigCl_ = j.cl; sigCt_ = j.ct; sigCr_ = j.cr; sigCb_ = j.cb;   // кроп, с которого снята prevSig_
+        }
         return dup;
     }
 
@@ -1848,8 +1891,9 @@ private:
     VkCommandBuffer sigCb_ = VK_NULL_HANDLE; VkFence sigFence_ = VK_NULL_HANDLE; VkSemaphore sigSem_ = VK_NULL_HANDLE;
     bool sigReady_ = false, sigFail_ = false, sigCoherent_ = true, prevValid_ = false;
     std::vector<uint8_t> prevSig_;
+    int sigCl_ = 0, sigCt_ = 0, sigCr_ = 0, sigCb_ = 0;   // кроп кадра, с которого снята prevSig_
     uint64_t dup_skipped_ = 0;
-    bool dupExtWarned_ = false;
+    bool dupExtWarned_ = false, dupSigWarned_ = false;
     // адаптивная нагрузка
     double gpu_ema_ = 0.0;
     int gov_level_ = 0, gov_over_ = 0, gov_under_ = 0;
