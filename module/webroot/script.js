@@ -101,6 +101,7 @@ const SCHEMA = [
     { k: 'hook_vk',       t: 'bool', def: 0, icon: '⚠️' },
     { k: 'hook_delay_ms', t: 'num',  def: 0, min: 0, max: 60000, step: 500, unit: 'ms', icon: '⏳' },
     { k: 'queue_prio',    t: 'bool', def: 1, icon: '🚀' },
+    { k: 'log',           t: 'bool', def: 1, icon: '📝' },
     { k: 'debug',         t: 'bool', def: 0, icon: '🐞' },
   ]},
 ];
@@ -209,6 +210,7 @@ ru: {
   z_srgb: 'sRGB', z_auto: 'авто', z_off: 'выкл', z_never: 'никогда', z_game: 'из игры', z_unset: 'нет',
   resetOne: 'Вернуть глобальное значение', resetCard: 'Сбросить группу к значениям по умолчанию', confirmReset: 'Сбросить?', resetDone: 'Сброшено',
   autoRefresh: 'Авто', mIdle: 'игра не шлёт кадры', mGpu: 'GPU', mGov: 'снижение нагрузки', mWarn: 'предупреждений', mHdr: 'HDR',
+  k_log: 'Писать лог', d_log: 'Выкл — модуль не пишет в logcat вообще (даже ошибки): игра не увидит записей. Лог в этом окне будет пуст.',
   k_debug: 'Подробный лог', d_debug: 'Адреса, форматы, первые кадры; статистика раз в секунду. Только для диагностики.',
   g_hud: 'Счётчик FPS',
   hm_fps: 'FPS', hm_arrow: 'Игра→вывод', hm_full: 'Подробно', hp_tl: '↖', hp_tr: '↗', hp_bl: '↙', hp_br: '↘',
@@ -336,6 +338,7 @@ en: {
   z_srgb: 'sRGB', z_auto: 'auto', z_off: 'off', z_never: 'never', z_game: 'from game', z_unset: 'none',
   resetOne: 'Restore the global value', resetCard: 'Reset this group to defaults', confirmReset: 'Reset?', resetDone: 'Reset',
   autoRefresh: 'Auto', mIdle: 'game sends no frames', mGpu: 'GPU', mGov: 'load reduction', mWarn: 'warnings', mHdr: 'HDR',
+  k_log: 'Write log', d_log: 'Off — the module writes nothing to logcat (not even errors), so the game sees no entries. The log in this window stays empty.',
   k_debug: 'Verbose log', d_debug: 'Addresses, formats, first frames; stats once per second. For diagnostics only.',
   g_hud: 'FPS counter',
   hm_fps: 'FPS', hm_arrow: 'Game→output', hm_full: 'Detailed', hp_tl: '↖', hp_tr: '↗', hp_bl: '↙', hp_br: '↘',

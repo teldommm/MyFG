@@ -15,7 +15,7 @@ void start(const char* package, void (*on_applied)()) {
     if (!package || !*package) return;
     std::string path = std::string("/data/data/") + package + "/myfg_live";
     std::thread([path, on_applied] {
-        pthread_setname_np(pthread_self(), "myfg-live");
+        name_thread("myfg-live");
         struct stat st {};
         bool have = stat(path.c_str(), &st) == 0;
         long long last_ns = have ? (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec : -1;
@@ -43,7 +43,7 @@ void start(const char* package, void (*on_applied)()) {
             D(enable) D(min_fps) D(max_dt_ms) D(acq_fence) D(zorder) D(display_fps) D(auto_rate) D(dataspace) D(hide_ms)
             D(release_lag) D(stats) D(max_gen) D(target_fps) D(flow_side) D(panel_hz) D(panel_game_vote) D(panel_anchor)
             D(multiplier) D(dup_detect) D(dup_thresh) D(use_oncomplete) D(layer_tf) D(hdr) D(hdr_pw) D(hdr_peak) D(hdr_knee) D(hdr_boost) D(hdr_gamma) D(hdr_ct) D(hdr_sat) D(adaptive)
-            D(gpu_budget) D(debug) D(hud) D(hud_mode) D(hud_pos) D(hud_scale) D(hud_tf)
+            D(gpu_budget) D(log) D(debug) D(hud) D(hud_mode) D(hud_pos) D(hud_scale) D(hud_tf)
             D(thermal) D(thermal_hi) D(thermal_lo) D(thermal_hz)
             D(pts_phase) D(qcom_me) D(me_refine) D(me_dy_sign)
             D(pacing)

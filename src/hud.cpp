@@ -133,7 +133,7 @@ void hideAndRelease(ASurfaceControl*& a) {
 }
 
 void loop() {
-    pthread_setname_np(pthread_self(), "myfg-hud");
+    name_thread("myfg-hud");
     AHardwareBuffer* bufs[kBufs] = {};
     int bufW = 0, bufH = 0, bufScale = 0;
     ASurfaceControl* a = nullptr;

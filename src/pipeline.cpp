@@ -1047,7 +1047,7 @@ private:
         }).detach();
     }
     void anchorLoop() {
-        pthread_setname_np(pthread_self(), "myfg-anchor");
+        name_thread("myfg-anchor");
         AHardwareBuffer* b[2] = {};
         AHardwareBuffer_Desc d{};
         d.width = 16; d.height = 16; d.layers = 1; d.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
@@ -1261,7 +1261,7 @@ private:
 
     // =============================================================== главный цикл
     void run() {
-        pthread_setname_np(pthread_self(), "myfg-pipe");
+        name_thread("myfg-pipe");
         void* h = dlopen("libandroid.so", RTLD_NOW);
         if (h) {
             setFrameTimeline_ = (PFN_setFrameTimeline)dlsym(h, "ASurfaceTransaction_setFrameTimeline");
@@ -1820,7 +1820,8 @@ private:
         add("dropLate", dropped_late_.load()); add("dropOut", dropped_out_); add("dropReal", dropped_real_);
         add("hidden", hidden_cnt_.load()); add("dup", dup_skipped_); add("importFail", import_fail_);
         add("fmtRej", cs.rejected_fmt); add("protRej", cs.rejected_prot); add("slotMiss", cs.slot_miss);
-        if (g_cfg.debug) { add("queued", cs.queued); add("dropJob", cs.dropped_job); }
+        add("dropJob", cs.dropped_job);
+        if (g_cfg.debug) add("queued", cs.queued);
         // судьба поля аппаратного ME — me=used/dropped. Печатается всегда при включённом
         // qcom_me (даже 0/0 — само по себе диагноз: поле ни разу не дошло до генерации).
         if (g_cfg.qcom_me && wfg_) {

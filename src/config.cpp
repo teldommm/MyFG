@@ -1,9 +1,23 @@
 #include "config.h"
 #include "util.h"
+#include "common.h"
+#include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
+#include <vector>
 #include <string.h>
 
 Config g_cfg;
+
+namespace {
+// Предупреждение о плохой строке конфига — один раз на ключ (parse вызывается и при live-обновлениях).
+void warnOnce(const std::string& key, const char* what, const std::string& val) {
+    static std::vector<std::string> seen;
+    for (const auto& k : seen) if (k == key) return;
+    if (seen.size() < 64) seen.push_back(key);
+    LOGW("config: %s '%s' (key '%s'), line ignored", what, val.c_str(), key.c_str());
+}
+}  // namespace
 
 void Config::parse(const char* blob) {
     if (!blob) return;
@@ -18,19 +32,29 @@ void Config::parse(const char* blob) {
         size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string k = trim(line.substr(0, eq));
-        int v = atoi(trim(line.substr(eq + 1)).c_str());
-#define KEY(name) if (k == #name) { name = v; continue; }
+        const std::string val = trim(line.substr(eq + 1));
+        char* endp = nullptr;
+        errno = 0;
+        const long lv = strtol(val.c_str(), &endp, 10);
+        bool numOk = !val.empty() && endp != val.c_str() && errno != ERANGE;
+        if (numOk) {                                   // после числа допустимы пробелы и «# комментарий»
+            while (*endp == ' ' || *endp == '\t') endp++;
+            numOk = *endp == '\0' || *endp == '#';
+        }
+        const int v = numOk ? (int)(lv < INT_MIN ? INT_MIN : lv > INT_MAX ? INT_MAX : lv) : 0;
+#define KEY(name) if (k == #name) { if (!numOk) { warnOnce(k, "not a number:", val); continue; } name = v; continue; }
         KEY(enable) KEY(min_fps) KEY(max_dt_ms) KEY(acq_fence) KEY(hook_egl) KEY(hook_vk)
         KEY(hook_surface) KEY(hook_delay_ms) KEY(hook_anw) KEY(zorder) KEY(display_fps) KEY(release_lag) KEY(stats)
         KEY(target_w) KEY(target_h) KEY(max_gen) KEY(target_fps) KEY(flow_side)
         KEY(auto_rate) KEY(dataspace) KEY(hide_ms)
         KEY(hook_swap) KEY(hook_present) KEY(fallback_ms) KEY(panel_hz) KEY(panel_game_vote) KEY(panel_anchor)
         KEY(multiplier) KEY(dup_detect) KEY(dup_thresh) KEY(use_oncomplete) KEY(queue_prio) KEY(elect_blast)
-        KEY(layer_tf) KEY(hook_bbq) KEY(ui_source) KEY(hook_sc) KEY(live) KEY(debug) KEY(hud) KEY(hud_mode) KEY(hud_pos) KEY(hud_scale) KEY(hud_tf) KEY(hdr) KEY(hdr_pw) KEY(hdr_peak) KEY(hdr_knee) KEY(hdr_boost) KEY(hdr_gamma) KEY(hdr_ct) KEY(hdr_sat) KEY(adaptive) KEY(gpu_budget)
+        KEY(layer_tf) KEY(hook_bbq) KEY(ui_source) KEY(hook_sc) KEY(live) KEY(log) KEY(debug) KEY(hud) KEY(hud_mode) KEY(hud_pos) KEY(hud_scale) KEY(hud_tf) KEY(hdr) KEY(hdr_pw) KEY(hdr_peak) KEY(hdr_knee) KEY(hdr_boost) KEY(hdr_gamma) KEY(hdr_ct) KEY(hdr_sat) KEY(adaptive) KEY(gpu_budget)
         KEY(thermal) KEY(thermal_hi) KEY(thermal_lo) KEY(thermal_hz)
         KEY(pts_phase) KEY(qcom_me) KEY(me_refine) KEY(me_dy_sign)
         KEY(pacing)
 #undef KEY
+        warnOnce(k, "unknown key, value", val);
     }
     sanitize();
 }
@@ -76,6 +100,7 @@ void Config::sanitize() {
     clampi(ui_source, 0, 1);
     clampi(layer_tf, -1, 7);
     clampi(live, 0, 1);
+    clampi(log, 0, 1);
     clampi(debug, 0, 1);
     clampi(hud, 0, 1);
     clampi(hud_mode, 0, 2);
@@ -112,7 +137,7 @@ void Config::applyLive(const Config& n) {
     L(enable) L(min_fps) L(max_dt_ms) L(acq_fence) L(zorder) L(display_fps) L(auto_rate) L(dataspace) L(hide_ms)
     L(release_lag) L(stats) L(max_gen) L(target_fps) L(flow_side) L(panel_hz) L(panel_game_vote) L(panel_anchor)
     L(multiplier) L(dup_detect) L(dup_thresh) L(use_oncomplete) L(layer_tf) L(hdr) L(hdr_pw) L(hdr_peak) L(hdr_knee) L(hdr_boost) L(hdr_gamma) L(hdr_ct) L(hdr_sat) L(adaptive) L(gpu_budget)
-    L(thermal) L(thermal_hi) L(thermal_lo) L(thermal_hz) L(debug) L(hud) L(hud_mode) L(hud_pos) L(hud_scale) L(hud_tf)
+    L(thermal) L(thermal_hi) L(thermal_lo) L(thermal_hz) L(log) L(debug) L(hud) L(hud_mode) L(hud_pos) L(hud_scale) L(hud_tf)
     L(pts_phase) L(qcom_me) L(me_refine) L(me_dy_sign) L(pacing)
     // Читаются на каждом кадре (elect()/blast_hint()), поэтому безопасно меняются на ходу.
     // Прежде live-правка target_w/target_h/elect_blast молча не действовала до рестарта игры.

@@ -224,11 +224,18 @@ bool VkCtx::ensureExtConv(const VkAndroidHardwareBufferFormatPropertiesANDROID& 
     cc.components = fp.samplerYcbcrConversionComponents;
     cc.xChromaOffset = fp.suggestedXChromaOffset;
     cc.yChromaOffset = fp.suggestedYChromaOffset;
-    cc.chromaFilter = VK_FILTER_NEAREST;
+    // Настоящий YUV (не RGB-identity у игр): хрома 4:2:0 восстанавливается линейно, если формат это умеет —
+    // иначе она блочная 2x2. Спека: chromaFilter LINEAR требует бита формата, а min/mag тогда обязаны совпадать
+    // с chromaFilter (без SEPARATE_RECONSTRUCTION) — на центрах текселей это луму не меняет. RGB-путь не трогаем.
+    const bool yuv = fp.suggestedYcbcrModel != VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY;
+    const bool linOk = (fp.formatFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT) != 0;
+    const VkFilter chromaF = (yuv && linOk) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+    cc.chromaFilter = chromaF;
     cc.forceExplicitReconstruction = VK_FALSE;
     VkResult r = f.CreateSamplerYcbcrConversion(dev, &cc, nullptr, &ext_.conv);
     if (r != VK_SUCCESS) { LOGW("ext: vkCreateSamplerYcbcrConversion failed %d", (int)r); ext_ = ExtConv(); return false; }
     ext_.ext_fmt = fp.externalFormat;
+    LOGD("ext: chroma filter %s (yuv=%d, linear feature=%d)", chromaF == VK_FILTER_LINEAR ? "LINEAR" : "NEAREST", (int)yuv, (int)linOk);
     LOGD("ext: ycbcr conversion model=%d range=%d comps=(%d,%d,%d,%d) chromaOff=(%d,%d)", (int)cc.ycbcrModel, (int)cc.ycbcrRange,
          (int)cc.components.r, (int)cc.components.g, (int)cc.components.b, (int)cc.components.a, (int)cc.xChromaOffset, (int)cc.yChromaOffset);
 
@@ -238,7 +245,7 @@ bool VkCtx::ensureExtConv(const VkAndroidHardwareBufferFormatPropertiesANDROID& 
     VkSamplerCreateInfo sc{};
     sc.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     sc.pNext = &sci;
-    sc.magFilter = sc.minFilter = VK_FILTER_NEAREST;
+    sc.magFilter = sc.minFilter = chromaF;
     sc.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     sc.addressModeU = sc.addressModeV = sc.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     sc.maxLod = 0.0f;

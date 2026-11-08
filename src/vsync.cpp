@@ -139,7 +139,7 @@ bool Vsync::start(Callback cb, void* user) {
 void Vsync::stop() { stop_ = true; }
 
 void Vsync::run() {
-    pthread_setname_np(pthread_self(), "myfg-vsync");
+    name_thread("myfg-vsync");
     ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
     impl_->ch = AChoreographer_getInstance();
     if (!impl_->ch) { LOGE("vsync: no choreographer"); running_ = false; return; }

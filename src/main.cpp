@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include "zygisk.hpp"
 #include "common.h"
+#include "capture.h"
 #include "config.h"
 #include "display.h"
 #include "hooks.h"
@@ -200,6 +201,11 @@ void begin() {
              g_cfg.hook_surface, g_cfg.hook_egl, g_cfg.hook_anw, g_cfg.hook_vk, g_cfg.hook_swap, g_cfg.hook_present, g_cfg.fallback_ms,
              g_cfg.elect_blast, g_cfg.hook_delay_ms, g_cfg.panel_game_vote, g_cfg.panel_anchor, g_cfg.use_oncomplete, g_cfg.queue_prio, g_cfg.layer_tf);
     }
+    // Хуки слоёв SurfaceControl (GPU-процесс браузера, hook_sc) ставим синхронно, пока приложение не создало
+    // ни одного слоя: иначе их «опоздание» (g_late) выключает захват слоёв до перезапуска браузера. Заодно нет
+    // гонки патча с чужими потоками. Символы libandroid — экспортируемые, ELF-разбор занимает миллисекунды.
+    // С hook_delay_ms > 0 (щадящий режим) задержка соблюдается и здесь. Не встало — повторит фоновый поток.
+    if (g_cfg.hook_delay_ms <= 0 && capture::installSc()) LOGD("surface-control hooks: early install done");
     std::thread([] {
         std::this_thread::sleep_for(std::chrono::milliseconds(50 + (g_cfg.hook_delay_ms > 0 ? g_cfg.hook_delay_ms : 0)));
         for (int i = 0; i < 400; i++) {                 // ~10 с по 100 мс, затем по 500 мс (до ~2 мин)
