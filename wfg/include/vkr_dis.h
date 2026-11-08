@@ -70,31 +70,6 @@ void vkr_dis_forget_targets(VkrDis* dis);
 
 void vkr_dis_reset(VkrDis* dis);
 
-/* ---- P2: external flow (hardware motion estimation) ----------------------------------------
- * Supplies a per-block vector field computed outside WFG (e.g. Adreno's GL_QCOM_motion_
- * estimation, the OpenFG donor's glTexEstimateMotionQCOM path) for the NEXT source pair.
- * `vectors` is grid_w*grid_h pairs (x, y) in pixels of the full source frame, forward
- * (ref -> target), in the frame's content coordinate space (top-left origin, y down).
- * It is resampled to the flow resolution, its magnitudes rescaled to flow texels, and
- * written into level 0 of the refined field, replacing DIS/Farneback's search+VR chain for
- * that pair; pack/splat/interpolate run unchanged. Consume-once: the next
- * vkr_dis_process() uses it and clears the request. Call between vkr_dis_prepare() and
- * vkr_dis_process(). Returns false if the engine is not built (the field is dropped).
- * Passing NULL/0 clears any pending request (the pair falls back to DIS). */
-/* Flow resolution the engine is currently built for (what vkr_dis_supply_flow resamples to).
- * A grid of exactly this size is taken as is (no resampling). false: engine not built, w = h = 0. */
-bool vkr_dis_flow_extent(const VkrDis* dis, uint32_t* w, uint32_t* h);
-
-bool vkr_dis_supply_flow(VkrDis* dis, const float* vectors, uint32_t grid_w, uint32_t grid_h,
-                          uint32_t full_w, uint32_t full_h);
-
-/* ---- P0: counters of the external-flow path (for the stats line) ----------------------------
- * Reports how many supplied fields were actually consumed by frame generation (ext_used) and
- * how many were lost (ext_dropped): rejected at supply time (no staging memory / grid coarser
- * than 4 blocks) or expired unused on a frame with no generation planned. used + dropped is the
- * full fate of every supplied field; the module prints them as me=used/dropped. */
-void vkr_dis_flow_stats(const VkrDis* dis, uint64_t* ext_used, uint64_t* ext_dropped);
-
 #ifdef __cplusplus
 }
 #endif

@@ -1,12 +1,10 @@
 // Vulkan-конвейер: кадр игры -> копия в кольцо -> WFG -> очередь вывода -> ASurfaceControl.
 //
 //  Потоки:
-//   * pipeline (run()) — единственный, кто трогает Vulkan: на каждое задание из capture пишет командный
-//     буфер (blit игрового буфера в кольцо, vkr_dis_process, N × vkr_dis_generate_into), делает submit
-//     и экспортирует его завершение как sync_fd. Благодаря одной очереди и одному потоку между
-//     копированием и WFG не нужны семафоры. С включённым qcom_me буферов и submit'ов два:
-//     blit уходит на GPU до блокирующего ME (glFinish+readback) — поле считается, пока GPU копирует
-//     кадр; зависимость закрывает барьер в начале второго буфера (submit'ы одной очереди упорядочены).
+//   * pipeline (run()) — единственный, кто трогает Vulkan: на каждое задание из capture пишет ОДИН
+//     командный буфер (blit игрового буфера в кольцо, vkr_dis_process, N × vkr_dis_generate_into),
+//     делает ОДИН submit и экспортирует его завершение как sync_fd. Благодаря одной очереди и одному
+//     потоку между копированием и WFG не нужны семафоры.
 //   * vsync (Vsync) — на каждый vsync берёт готовый OutItem, выбирает frame-timeline и делает
 //     ASurfaceTransaction_apply. Vulkan там не используется.
 //   * callbacks SurfaceFlinger (onComplete) — замер лэтча и контур пейсинга:
@@ -26,7 +24,6 @@
 #include "hud.h"
 #include "vk_ctx.h"
 #include "hdr.h"
-#include "qcom_me.h"
 #include "qcom_ex.h"
 #include "display.h"
 #include "vsync.h"
@@ -109,8 +106,7 @@ struct OutItem {
 };
 
 struct FrameRes {
-    VkCommandBuffer cb = VK_NULL_HANDLE;    // буфер A: blit игрового кадра (submit до ME)
-    VkCommandBuffer cb2 = VK_NULL_HANDLE;   // буфер B: WFG + HDR (второй submit, только при qcom_me)
+    VkCommandBuffer cb = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkSemaphore wait_sem = VK_NULL_HANDLE;   // сюда импортируется acquire-fence игры
     VkSemaphore sig_sem = VK_NULL_HANDLE;    // экспортируется в sync_fd
@@ -523,11 +519,8 @@ private:
             ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
             ai.commandPool = pool_;
             ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            ai.commandBufferCount = 2;      // A (blit, уходит на GPU до ME) + B (WFG+HDR)
-            VkCommandBuffer cbs[2] = {};
-            if (vk_.f.AllocateCommandBuffers(vk_.dev, &ai, cbs) != VK_SUCCESS) return false;
-            fr.cb = cbs[0];
-            fr.cb2 = cbs[1];
+            ai.commandBufferCount = 1;
+            if (vk_.f.AllocateCommandBuffers(vk_.dev, &ai, &fr.cb) != VK_SUCCESS) return false;
             VkFenceCreateInfo fi{};
             fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
             if (vk_.f.CreateFence(vk_.dev, &fi, nullptr, &fr.fence) != VK_SUCCESS) return false;
@@ -1378,7 +1371,6 @@ private:
             exWas_ = ex;
             exMode_.store(ex);
             prevValid_ = false;
-            qcomMe::reset();
             if (ex) { qcomEx::reset(); LOGI("frame generation: Adreno extrapolation (qcom_ex)"); }
             else {
                 if (wfg_) vkr_dis_reset(wfg_);                 // история WFG прервана — пары через разрыв не нужны
@@ -1532,25 +1524,6 @@ private:
             }
         }
 
-        // ---- аппаратный ME Adreno (GL_QCOM_motion_estimation) ------------------------------------
-        // Поле снаружи -> WFG (vkr_dis_supply_flow): пара получает вектора от аппаратного блока ME
-        // (но не бесплатно: glFinish + readback + билинейный пересчёт поля на CPU каждый кадр),
-        // DIS/Farneback остаётся фолбэком — нет расширения, ошибка GL, мелкое окно.
-        // Цепочка luma-снимков идёт каждый кадр (даже без генерации), иначе пары разъезжаются.
-        // Перед отдачей поле уточняется на GPU внутри ME-конвейера (me_refine: медиана
-        // временного поля, gain-компенсация, защита центра), затем блочная редукция в сетку ME —
-        // контракт с WFG не меняется.
-        // Сам ME-блок выполняется ниже — между submit'ом A (blit) и записью буфера B: readback
-        // нужен WFG-проходу, а не блиту. Здесь остаётся только решение о запуске — оно нужно
-        // до записи, чтобы выбрать схему submit'ов.
-        bool meActive = g_cfg.qcom_me && wfg_ok && !meFail_;
-        // acquire-fence игры нужен обоим читателям буфера: blit'у (wait_sem, fd заберёт импорт в
-        // submit A) и luma-снимку ME (свой EGL-wait) — дублируем заранее. Не продублировался —
-        // кадр без ME: одним submit'ом, DIS.
-        int meFence = meActive && j.fence_fd >= 0 ? dup(j.fence_fd) : -1;
-        if (meActive && j.fence_fd >= 0 && meFence < 0) meActive = false;
-        if (!meActive && !meFail_) qcomMe::reset();   // кадр мимо ME — цепочка рвётся
-
         // подсказка частоты слоя для auto_rate: только когда план держится ~30 кадров подряд
         if ((int)planned == plan_last_) plan_stable_++; else { plan_last_ = (int)planned; plan_stable_ = 0; }
         if (g_cfg.auto_rate && src_n_ >= 8 && plan_stable_ >= 30) {
@@ -1559,19 +1532,17 @@ private:
             want_rate_.store((float)floor(r + 0.5));
         }
 
-        // --- запись команд: буфер A (blit игрового кадра в кольцо) --------------------------------
-        // meActive: буферов два — A (blit) уходит на GPU немедленно, B (WFG+HDR) записывается после ME.
-        // Иначе это один буфер и один submit (запись и submit B продолжают использовать cb).
-        VkCommandBuffer cbA = fr.cb;
-        vk_.f.ResetCommandBuffer(cbA, 0);
+        // --- запись команд ------------------------------------------------------------
+        VkCommandBuffer cb = fr.cb;
+        vk_.f.ResetCommandBuffer(cb, 0);
         VkCommandBufferBeginInfo bi{};
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vk_.f.BeginCommandBuffer(cbA, &bi);
-        if (fr.qp && !meActive) {
-            vk_.f.CmdResetQueryPool(cbA, fr.qp, 0, 3);
+        vk_.f.BeginCommandBuffer(cb, &bi);
+        if (fr.qp) {
+            vk_.f.CmdResetQueryPool(cb, fr.qp, 0, 3);
             // TRANSFER-стадия: начало отсчёта после ожидания acquire-fence игры (иначе в «время GPU» попало бы её рендеринг)
-            vk_.f.CmdWriteTimestamp(cbA, VK_PIPELINE_STAGE_TRANSFER_BIT, fr.qp, 0);
+            vk_.f.CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, fr.qp, 0);
         }
 
         const uint32_t FOREIGN = VK_QUEUE_FAMILY_FOREIGN_EXT, Q = vk_.qfam;
@@ -1580,28 +1551,28 @@ private:
 
         const bool ext = src->external;
         if (ext) {
-            barrier(cbA, src->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            barrier(cb, src->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     0, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, FOREIGN, Q);
         } else {
-            barrier(cbA, src->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            barrier(cb, src->image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     0, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, FOREIGN, Q);
         }
-        barrier(cbA, real->im.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        barrier(cb, real->im.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 0, VK_ACCESS_TRANSFER_WRITE_BIT, ALL, VK_PIPELINE_STAGE_TRANSFER_BIT, FOREIGN, Q);
 
         if (ext) {
             // Внешний формат: читаем через YCbCr-сэмплер compute-шейдером в обычный RGBA8, затем копия в кольцо.
             const int32_t crop[4] = {j.cl, j.ct, j.cr, j.cb};
-            barrier(cbA, plain_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+            barrier(cb, plain_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
                     VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-            vk_.recordExtCopy(cbA, *src, plain_, crop, frIdx_);
-            barrier(cbA, plain_.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            vk_.recordExtCopy(cb, *src, plain_, crop, frIdx_);
+            barrier(cb, plain_.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
             VkImageCopy cp{};
             cp.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             cp.extent = {w, h, 1};
-            vk_.f.CmdCopyImage(cbA, plain_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            vk_.f.CmdCopyImage(cb, plain_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                real->im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
         } else {
             VkImageBlit bl{};
@@ -1611,73 +1582,11 @@ private:
             bl.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             bl.dstOffsets[0] = {0, 0, 0};
             bl.dstOffsets[1] = {(int32_t)w, (int32_t)h, 1};
-            vk_.f.CmdBlitImage(cbA, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            vk_.f.CmdBlitImage(cb, src->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                real->im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
         }
 
-        // --- submit A: blit уходит на GPU до ME ---------------------------------------------------
-        // Пока CPU стоит в ME (glFinish + readback, ~1–2 мс), blit уже исполняется на GPU;
-        // GL-команды ME тоже уходят сразу после A. Submit'ы одной очереди
-        // упорядочены и для барьеров не граница («как один большой командный буфер», спецификация),
-        // поэтому B не ждёт ничего, кроме барьера на real в его начале.
-        if (meActive) {
-            vk_.f.EndCommandBuffer(cbA);
-            bool waitedA = false;
-            if (j.fence_fd >= 0) {
-                if (vk_.importSyncFd(fr.wait_sem, j.fence_fd)) { waitedA = true; j.fence_fd = -1; }
-                else { struct pollfd p = {j.fence_fd, POLLIN, 0}; poll(&p, 1, 20); }   // CPU-ожидание, если импорт невозможен
-            }
-            const VkPipelineStageFlags wstA = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-            VkSubmitInfo siA{};
-            siA.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            siA.waitSemaphoreCount = waitedA ? 1 : 0;
-            siA.pWaitSemaphores = &fr.wait_sem;
-            siA.pWaitDstStageMask = &wstA;
-            siA.commandBufferCount = 1;
-            siA.pCommandBuffers = &cbA;
-            if (vk_.f.QueueSubmit(vk_.queue, 1, &siA, VK_NULL_HANDLE) != VK_SUCCESS) {
-                LOGE("vkQueueSubmit failed (blit)");
-                if (meFence >= 0) close(meFence);
-                real->hold.store(0);
-                for (uint32_t g = 0; g < planned; g++) gen[g]->hold.store(0);
-                for (uint32_t g = 0; g < planned; g++) if (upGen[g]) upGen[g]->hold.store(0);
-                if (upReal) upReal->hold.store(0);
-                return;
-            }
-
-            // ---- ME + supply: CPU стоит в glFinish/readback, GPU в это время делает blit ----
-            if (!qcomMe::ensure()) meFail_ = true;
-            else {
-                const float* mv = nullptr;
-                uint32_t mgw = 0, mgh = 0;
-                // сетка потока WFG: refine отдаёт поле сразу на ней, supply_flow его не пересэмплирует
-                uint32_t flw = 0, flh = 0;
-                vkr_dis_flow_extent(wfg_, &flw, &flh);
-                if (qcomMe::frame(j.src, meFence, j.cl, j.ct, j.cr, j.cb, (int)j.bw, (int)j.bh,
-                                  (int)flw, (int)flh, &mv, &mgw, &mgh))
-                    // full_w/h — контент (вектора в его пикселях): масштаб и сетка считаются от него
-                    vkr_dis_supply_flow(wfg_, mv, mgw, mgh, (uint32_t)(j.cr - j.cl), (uint32_t)(j.cb - j.ct));
-            }
-            if (meFence >= 0) close(meFence);
-        }
-
-        // --- запись команд: буфер B (WFG + HDR) — второй при meActive, иначе продолжение A ---------
-        VkCommandBuffer cb = meActive ? fr.cb2 : cbA;
-        if (meActive) {
-            vk_.f.ResetCommandBuffer(cb, 0);
-            VkCommandBufferBeginInfo bi2{};
-            bi2.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            bi2.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vk_.f.BeginCommandBuffer(cb, &bi2);
-            if (fr.qp) {
-                vk_.f.CmdResetQueryPool(cb, fr.qp, 0, 3);
-                // начало отсчёта здесь, а не в A: ME не должно попадать в «время GPU» governor'а
-                vk_.f.CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, fr.qp, 0);
-            }
-        }
-
-        // WFG ждёт исходник в GENERAL. При meActive барьер первый в B — и он же закрывает
-        // зависимость от blit'а в A (srcAccess TRANSFER_WRITE барьера покрывает запись в A).
+        // WFG ждёт исходник в GENERAL.
         barrier(cb, real->im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
                 VK_ACCESS_TRANSFER_WRITE_BIT, RW, VK_PIPELINE_STAGE_TRANSFER_BIT, ALL);
 
@@ -1722,9 +1631,9 @@ private:
         if (fr.qp) vk_.f.CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, fr.qp, 2);
         vk_.f.EndCommandBuffer(cb);
 
-        // --- submit B (единственный при выключенном ME) --------------------------------------------
+        // --- submit ---------------------------------------------------------------------
         bool waited_on_gpu = false;
-        if (!meActive && j.fence_fd >= 0) {          // при meActive fence игры уже ждёт submit A
+        if (j.fence_fd >= 0) {
             if (vk_.importSyncFd(fr.wait_sem, j.fence_fd)) { waited_on_gpu = true; j.fence_fd = -1; }
             else { struct pollfd p = {j.fence_fd, POLLIN, 0}; poll(&p, 1, 20); }   // CPU-ожидание, если импорт невозможен
         }
@@ -1740,8 +1649,6 @@ private:
         si.pSignalSemaphores = &fr.sig_sem;
         if (vk_.f.QueueSubmit(vk_.queue, 1, &si, fr.fence) != VK_SUCCESS) {
             LOGE("vkQueueSubmit failed");
-            // при meActive submit A уже на GPU: отпускать слоты можно только после его завершения
-            if (meActive) vk_.f.DeviceWaitIdle(vk_.dev);
             real->hold.store(0);
             for (uint32_t g = 0; g < planned; g++) gen[g]->hold.store(0);
             for (uint32_t g = 0; g < planned; g++) if (upGen[g]) upGen[g]->hold.store(0);
@@ -1769,7 +1676,7 @@ private:
         const int64_t base_out = base;
         // P0-fix: λ считается в ТОЧКЕ ВЫВОДА (после submit), а не в точке захвата.
         // Раньше λ = ts - pts ≈ 0 у игр (метка = момент queueBuffer), и якорь base = pts
-        // оказывался в прошлом на величину латентности конвейера (import/ME/GPU submit,
+        // оказывался в прошлом на величину латентности конвейера (import/GPU submit,
         // 5-20 мс). При 60 fps шаг блока 8.3 мс < латентности: цель gen-кадра (base)
         // постоянно в прошлом, «догон» (dropLate > 1.5 периода) выкидывал gen-кадры
         // вразнобой — итоговый FPS плавал вместо 120. Теперь λ поглощает всю латентность:
@@ -2113,20 +2020,6 @@ private:
         add("fmtRej", cs.rejected_fmt); add("protRej", cs.rejected_prot); add("slotMiss", cs.slot_miss);
         add("dropJob", cs.dropped_job);
         if (g_cfg.debug) add("queued", cs.queued);
-        // судьба поля аппаратного ME — me=used/dropped. Печатается всегда при включённом
-        // qcom_me (даже 0/0 — само по себе диагноз: поле ни разу не дошло до генерации).
-        if (g_cfg.qcom_me && wfg_) {
-            uint64_t mu = 0, md = 0;
-            vkr_dis_flow_stats(wfg_, &mu, &md);
-            if (o < sizeof ex - 32)
-                o += (size_t)snprintf(ex + o, sizeof ex - o, " me=%llu/%llu",
-                                      (unsigned long long)mu, (unsigned long long)md);
-            // время ME (GL-контекст, в gpu= не входит): среднее/максимум frame() и среднее ожидание glFinish
-            const qcomMe::Stats ms = qcomMe::takeStats();
-            if (ms.frames && o < sizeof ex - 48)
-                o += (size_t)snprintf(ex + o, sizeof ex - o, " meT=%.1f/%.1fms stall=%.1f",
-                                      ms.avgMs, ms.maxMs, ms.avgStallMs);
-        }
         // qcom_ex: предсказано кадров, CPU-время подачи (begin+finish) и GPU-время кадра (если есть таймер-запросы)
         if (exWas_) {
             const qcomEx::Stats es = qcomEx::takeStats();
@@ -2235,8 +2128,6 @@ private:
     bool therm_no_sensor_ = false;
     // SDR -> HDR
     HdrPass hdr_;
-    // ---- аппаратный ME
-    bool meFail_ = false;                 // qcom_me включён, но модуль не встал: без повторов
     // ---- аппаратная экстраполяция (qcom_ex)
     bool exFail_ = false;                 // qcom_ex включён, но модуль не встал / умер: без повторов, работает WFG
     bool exWas_ = false;                  // режим активен на предыдущем кадре (для переходов и статистики)

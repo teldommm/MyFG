@@ -45,7 +45,7 @@ void start(const char* package, void (*on_applied)()) {
             D(multiplier) D(dup_detect) D(dup_thresh) D(use_oncomplete) D(layer_tf) D(hdr) D(hdr_pw) D(hdr_peak) D(hdr_knee) D(hdr_boost) D(hdr_gamma) D(hdr_ct) D(hdr_sat) D(adaptive)
             D(gpu_budget) D(log) D(debug) D(hud) D(hud_mode) D(hud_pos) D(hud_scale) D(hud_tf)
             D(thermal) D(thermal_hi) D(thermal_lo) D(thermal_hz)
-            D(pts_phase) D(qcom_me) D(qcom_ex) D(me_refine) D(me_dy_sign)
+            D(pts_phase) D(qcom_ex)
             D(pacing)
             D(target_w) D(target_h) D(elect_blast) D(ui_source)
 #undef D

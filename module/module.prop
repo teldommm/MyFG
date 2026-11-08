@@ -1,6 +1,6 @@
 id=myfg
 name=MyFG
-version=v0.31.0
-versionCode=310
+version=v0.31.1
+versionCode=311
 author=@teldommm
 description=Frame Generation via zygisk

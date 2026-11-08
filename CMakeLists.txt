@@ -71,7 +71,6 @@ add_library(myfg SHARED
   src/live.cpp
   src/hud.cpp
   src/hdr.cpp
-  src/qcom_me.cpp
   src/qcom_ex.cpp
   src/gl_island.cpp
   src/display.cpp

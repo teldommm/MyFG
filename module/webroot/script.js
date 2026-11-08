@@ -66,9 +66,6 @@ const SCHEMA = [
     { k: 'dup_detect', t: 'bool', def: 0, icon: '👯' },
     { k: 'dup_thresh', t: 'pick', def: 2, min: 0, max: 64, vals: [0, 2, 6], opts: ['pk_exact', 'pk_normal', 'pk_soft'], icon: '📏', dep: [['dup_detect', '=', 1]], dyn: 'duphint' },
     { k: 'qcom_ex',   t: 'bool', def: 0, icon: '🔮', dyn: 'exhint' },
-    { k: 'qcom_me',   t: 'bool', def: 0, icon: '🧲', dyn: 'mehint', dep: [['qcom_ex', '=', 0]] },
-    { k: 'me_refine', t: 'pick', def: 1, min: 0, max: 2, vals: [0, 1, 2], opts: ['mr_off', 'mr_light', 'mr_full'], icon: '🧹', dep: [['qcom_me', '=', 1]] },
-    { k: 'me_dy_sign', t: 'pick', def: 0, min: 0, max: 2, vals: [0, 1, 2], opts: ['mds_auto', 'mds_down', 'mds_up'], icon: '🧭', dep: [['qcom_me', '=', 1]] },
     { k: 'panel_game_vote', t: 'bool', def: 1, icon: '🗳️', dep: [['panel_hz', '>', 0]] },
     { k: 'panel_anchor',    t: 'bool', def: 0, icon: '⚓', dep: [['panel_hz', '>', 0]] },
     { k: 'hdr_peak', t: 'num', def: 0, min: 0, max: 1400, step: 50, zsnap: 400, sl: 1, smin: 400, unit: 'nit', icon: '🔆', z: 'z_auto', quick: [0, 600, 800, 1000, 1200], dep: [['hdr', '=', 1]] },
@@ -174,15 +171,9 @@ ru: {
   k_multiplier: 'Множитель', d_multiplier: 'Сколько кадров выводится на один кадр игры: ×2 — один добавленный, ×3 — два и т.д. Не больше, чем успевает показать экран.',
   k_dup_detect: 'Детект повторных кадров', d_dup_detect: 'Пропускает повторы, когда игра постит 60 к/с при 30 уникальных. Цена: ожидание CPU на каждый кадр. Не работает с буферами во внешнем формате (YCbCr).',
   k_pts_phase: 'Фаза по меткам источника', d_pts_phase: 'Ритм и фаза вывода берутся из меток времени кадров (PTS), а не из момента прибытия: убирает дрожание (judder) на 24/30 fps → 120 Гц. Нет PTS — откат на момент прибытия.',
-  k_qcom_ex: 'Экстраполяция Adreno', d_qcom_ex: 'Кадры предсказывает драйвер Adreno (GL_QCOM_frame_extrapolation): без задержки интерполяции, но качество ниже. Заменяет WFG и ME. Экспериментально.',
-  k_qcom_me: 'Аппаратный ME (Adreno)', d_qcom_me: 'Вектора движения берутся у аппаратного блока Adreno (GL_QCOM_motion_estimation): почти бесплатно, DIS остаётся запасным. Экспериментально.',
-  k_me_refine: 'Уточнение поля ME', d_me_refine: 'Доводка аппаратного поля на GPU: медиана по времени, компенсация экспозиции (фейды, вспышки), защита центра (HUD). «Лёгкое» — 4-угловая SAD, «Полное» — гекс-поиск по 34 кандидатам.',
-  mr_off: 'Выкл', mr_light: 'Лёгкое', mr_full: 'Полное',
-  k_me_dy_sign: 'Знак Y поля ME', d_me_dy_sign: 'Направление оси Y у векторов ME. «Самотест» определяет его при старте игры; если картинка «плывёт» по вертикали — задайте вручную: «Y вниз» (без коррекции) или «Y вверх» (инверсия). Применяется сразу.',
-  mds_auto: 'Самотест', mds_down: 'Y вниз', mds_up: 'Y вверх',
+  k_qcom_ex: 'Экстраполяция Adreno', d_qcom_ex: 'Кадры предсказывает драйвер Adreno (GL_QCOM_frame_extrapolation): без задержки интерполяции, но качество ниже. Заменяет WFG. Экспериментально.',
   k_pacing: 'Пейсинг с обратной связью', d_pacing: 'По onComplete измеряется момент показа; при стабильном опоздании разрешаются более ранние таймлайны (до +2.5 мс), при запасе надбавка снимается. Нужны onComplete и Android 13+.',
   dyn_ptshint: 'По логу часть кадров без PTS — для них фаза берётся по моменту прибытия.',
-  dyn_mehint: 'По логу аппаратный ME недоступен (нет расширения или ошибка GL) — поток считает DIS.',
   dyn_exhint: 'По логу экстраполяция недоступна (нет расширения, ошибка GL или самотест не прошёл) — работает интерполяция WFG.',
   dyn_thermhint: 'По логу датчика температуры батареи нет — ограничение неактивно, вывод всегда на полном темпе.',
   k_dup_thresh: 'Порог повтора', d_dup_thresh: 'Насколько кадры должны различаться, чтобы считаться разными: «Точные» пропускают только идентичные, «Мягкий» — и почти одинаковые.',
@@ -304,15 +295,9 @@ en: {
   k_multiplier: 'Multiplier', d_multiplier: 'Output frames per game frame: ×2 = one added frame, ×3 = two, and so on. Capped by what the display can show.',
   k_dup_detect: 'Duplicate-frame detection', d_dup_detect: 'Skips repeats when the game posts 60 fps with 30 unique. Cost: a CPU wait every frame. Does not work with external-format (YCbCr) buffers.',
   k_pts_phase: 'Phase from source timestamps', d_pts_phase: 'Output rhythm and phase come from frame timestamps (PTS) instead of arrival time: removes judder at 24/30 fps → 120 Hz. No PTS = falls back to arrival time.',
-  k_qcom_ex: 'Adreno extrapolation', d_qcom_ex: 'The Adreno driver predicts frames (GL_QCOM_frame_extrapolation): no interpolation delay, but lower quality. Replaces WFG and ME. Experimental.',
-  k_qcom_me: 'Hardware ME (Adreno)', d_qcom_me: 'Motion vectors come from the Adreno hardware block (GL_QCOM_motion_estimation): nearly free, DIS stays the fallback. Experimental.',
-  k_me_refine: 'ME field refinement', d_me_refine: 'GPU polish of the hardware field: temporal median, exposure compensation (fades, flashes), centre (HUD) protection. “Light” = 4-corner SAD, “Full” = hex search over 34 candidates.',
-  mr_off: 'Off', mr_light: 'Light', mr_full: 'Full',
-  k_me_dy_sign: 'ME field Y-axis sign', d_me_dy_sign: 'Y-axis direction of the ME vectors. “Self-test” detects it at game start; if the picture drifts vertically, set it by hand: “Y down” (no correction) or “Y up” (inverted). Applied instantly.',
-  mds_auto: 'Self-test', mds_down: 'Y down', mds_up: 'Y up',
+  k_qcom_ex: 'Adreno extrapolation', d_qcom_ex: 'The Adreno driver predicts frames (GL_QCOM_frame_extrapolation): no interpolation delay, but lower quality. Replaces WFG. Experimental.',
   k_pacing: 'Feedback pacing', d_pacing: 'onComplete measures the present time; a steady lateness allows earlier timelines (up to +2.5 ms), and the slack is dropped when there is headroom. Needs onComplete and Android 13+.',
   dyn_ptshint: 'Per the log some frames carry no PTS; those keep the arrival-based phase.',
-  dyn_mehint: 'Per the log hardware ME is unavailable (no extension or a GL error): DIS computes the flow.',
   dyn_exhint: 'Per the log extrapolation is unavailable (no extension, a GL error or the self-test failed): WFG interpolation runs.',
   dyn_thermhint: 'Per the log there is no battery temperature sensor: the cap is inactive, output always runs at full rate.',
   k_dup_thresh: 'Duplicate threshold', d_dup_thresh: 'How different frames must be to count as new: “Exact” skips identical frames only, “Soft” also nearly identical ones.',
@@ -877,7 +862,7 @@ function paintExpert() {
 
 /* Сведения из лога выбранной игры. Показываем «что получилось» только для запущенной игры: у остановленной
    (или с выключенной генерацией, или стоящей в меню) прежняя строка вводила бы в заблуждение. */
-const INFO = { plan: null, stats: null, idle: false, paused: false, running: false, govFlow: 0, queue: null, dupUnavail: false, hdrNo: false, ptsPartial: false, meOff: false, exOff: false, thermNo: false, thermCapped: false };
+const INFO = { plan: null, stats: null, idle: false, paused: false, running: false, govFlow: 0, queue: null, dupUnavail: false, hdrNo: false, ptsPartial: false, exOff: false, thermNo: false, thermCapped: false };
 const LINE_PID = /^[VDIWEF]\/\S*\s*\(\s*(\d+)\)/;
 const linePid = l => { const m = LINE_PID.exec(l); return m ? m[1] : null; };
 
@@ -899,7 +884,7 @@ function scopeLog(res, sc) {
 }
 
 function parseInfo(text, running) {
-  INFO.plan = INFO.stats = INFO.queue = null; INFO.idle = INFO.paused = false; INFO.govFlow = 0; INFO.dupUnavail = false; INFO.hdrNo = false; INFO.ptsPartial = INFO.meOff = INFO.exOff = false; INFO.thermNo = INFO.thermCapped = false;
+  INFO.plan = INFO.stats = INFO.queue = null; INFO.idle = INFO.paused = false; INFO.govFlow = 0; INFO.dupUnavail = false; INFO.hdrNo = false; INFO.ptsPartial = INFO.exOff = false; INFO.thermNo = INFO.thermCapped = false;
   INFO.running = !!running;
   const lines = (text || '').split('\n');
   let decided = false, govSeen = false;
@@ -921,7 +906,6 @@ function parseInfo(text, running) {
     if (/dup_detect unavailable/.test(l)) INFO.dupUnavail = true;
     if (/HDR: the panel reports no HDR support/.test(l)) INFO.hdrNo = true;
     if (/pts-phase: .*some frames carry no PTS/.test(l)) INFO.ptsPartial = true;
-    if (/qcom-me: .*(DIS stays the flow solver)/.test(l)) INFO.meOff = true;
     if (/qcom-ex: .*(WFG stays the frame generator)/.test(l)) INFO.exOff = true;
     if (/thermal: no battery temp sensor/.test(l)) INFO.thermNo = true;
     if (/thermal: battery .*C >= \d+C, output capped/.test(l)) INFO.thermCapped = true;
@@ -1088,7 +1072,6 @@ function paintCustom() {
     hdrhint: () => effective('hdr') === 1 && INFO.hdrNo,
     duphint: () => effective('dup_detect') === 1 && INFO.dupUnavail,
     ptshint: () => effective('pts_phase') === 1 && INFO.ptsPartial,
-    mehint: () => effective('qcom_me') === 1 && INFO.meOff,
     exhint: () => effective('qcom_ex') !== 0 && INFO.exOff,
     thermhint: () => effective('thermal') === 1 && INFO.thermNo,
   };

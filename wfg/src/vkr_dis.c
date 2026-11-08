@@ -86,8 +86,6 @@
 #define DIS_MAX_DESCRIPTOR_WRITES 256u
 
 #define DIS_SLOTS 3u
-/* Число staging-буферов внешнего поля; обязано быть > числа кадров рендерера в полёте. */
-#define DIS_EXT_RING 4u
 
 #define DIS_PROP_STEPS_MAX 4u
 
@@ -347,22 +345,6 @@ struct VkrDis {
     bool fb_hybrid_l1_start;  // DIS_ENGINE_HYBRID on two DIS levels: Farneback's level 1 as a start
     bool fb_hybrid_vr_upper;  // DIS_ENGINE_HYBRID: refine the DIS levels above 0 as well
     float fb_ig[4];
-
-    /* ---- P2: external flow (hardware motion estimation, GL_QCOM_motion_estimation) ----
-     * Staging host buffer + one-shot request flag. The field is written into level 0 of
-     * flow_refined by vkr_dis_process() instead of the search+VR chain. */
-    /* Кольцо staging-буферов: CPU пишет поле кадра N, пока GPU кадров N-1..N-2 ещё читает свои
-     * копии через CmdCopyBufferToImage (рендерер ждёт fence лишь кадра N-kFrames). Каждый
-     * supply берёт следующий буфер кольца; DIS_EXT_RING > kFrames рендерера (3) => буфер,
-     * в который пишем, последний раз читался кадром, fence которого уже дождались. */
-    VkBuffer flow_ext_buf[DIS_EXT_RING];
-    VkDeviceMemory flow_ext_mem[DIS_EXT_RING];
-    void* flow_ext_map[DIS_EXT_RING];
-    uint32_t flow_ext_next;         /* куда писать следующий supply */
-    uint32_t flow_ext_cur;          /* буфер, поставленный последним supply (читает process) */
-    uint32_t flow_ext_texels;       /* capacity in R32G32 texels */
-    bool flow_ext_pending;
-    uint64_t flow_ext_used, flow_ext_dropped;
 };
 
 typedef struct {
@@ -1766,8 +1748,6 @@ VkrDis* vkr_dis_create(VkDevice device, VkPhysicalDevice physical_device) {
     return d;
 }
 
-static void dis_free_flow_ext(VkrDis* d);
-
 void vkr_dis_destroy(VkrDis* d) {
     if (!d) return;
     dis_destroy_images(d);
@@ -1798,8 +1778,6 @@ void vkr_dis_destroy(VkrDis* d) {
     if (d->vr_pipeline_layout) vkd.DestroyPipelineLayout(d->device, d->vr_pipeline_layout, NULL);
     if (d->set_layout) vkd.DestroyDescriptorSetLayout(d->device, d->set_layout, NULL);
     if (d->vr_set_layout) vkd.DestroyDescriptorSetLayout(d->device, d->vr_set_layout, NULL);
-    /* P2: staging внешнего поля */
-    dis_free_flow_ext(d);
     free(d);
 }
 
@@ -2356,41 +2334,13 @@ void vkr_dis_process(VkrDis* d, VkCommandBuffer cmd, VkImage source, uint32_t wi
 
     const bool farneback = d->flow_engine == DIS_ENGINE_FARNEBACK;
     const bool hybrid = d->flow_engine == DIS_ENGINE_HYBRID;
-    /* P2: поле, поданное снаружи (аппаратный ME), заменяет и Farneback, и DIS-поиск.
-     * Буфер мог не собраться (нет памяти) — тогда тихий откат на штатный решатель. */
-    const bool ext_flow = d->flow_ext_pending && d->flow_ext_buf[d->flow_ext_cur] != VK_NULL_HANDLE;
-    if (ext_flow) d->flow_ext_pending = false;
-    if (!ext_flow && (farneback || hybrid)) dis_fb_expand(d, cmd, slot, L, w, h);
+    if (farneback || hybrid) dis_fb_expand(d, cmd, slot, L, w, h);
 
     if (!wants_flow) {
         d->prior_valid = false;
-        /* P0: поле было подано, но генерации в этом кадре не планируется — оно сгорает
-         * неиспользованным (pending уже снят выше). Считаем дропом: иначе me= в статистике
-         * молчал бы о потерях на кадрах без генерации. */
-        if (ext_flow) d->flow_ext_dropped++;
         return;
     }
-    if (ext_flow) {
-        d->flow_ext_used++;
-        /* Поле снаружи -> уровень 0 refined (формат и разрешение совпадают: R32G32F,
-         * built_extent). Копия из staging, GENERAL допускает transfer; дальше pack/splat/interp
-         * читают его ровно как поле, вышедшее из DIS. */
-        VkBufferImageCopy cp;
-        memset(&cp, 0, sizeof cp);
-        cp.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        cp.imageSubresource.mipLevel = 0;
-        cp.imageSubresource.layerCount = 1;
-        cp.imageExtent.width = w;
-        cp.imageExtent.height = h;
-        cp.imageExtent.depth = 1;
-        vkd.CmdCopyBufferToImage(cmd, d->flow_ext_buf[d->flow_ext_cur], d->flow_refined.image,
-                                 VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
-        dis_barrier(cmd, d->flow_refined.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        DIS_PROF(cmd, "ext flow");
-    } else if (farneback) {
+    if (farneback) {
         dis_farneback(d, cmd, slot, L, w, h, 0, false);
     } else {
         // The hybrid's coarse levels are Farneback's; the search on the levels below starts from
@@ -2681,136 +2631,4 @@ void vkr_dis_reset(VkrDis* d) {
     d->hist_parity = 0;
     d->hist_valid = false;
     d->prior_valid = false;
-    d->flow_ext_pending = false;   /* P2: сброшенная пара не наследует чужое поле */
-}
-
-/* ---- P2: внешнее поле потока (аппаратный ME) --------------------------------------------- */
-
-static void dis_free_flow_ext(VkrDis* d) {
-    for (uint32_t k = 0; k < DIS_EXT_RING; k++) {
-        if (d->flow_ext_map[k]) { vkd.UnmapMemory(d->device, d->flow_ext_mem[k]); d->flow_ext_map[k] = NULL; }
-        if (d->flow_ext_buf[k]) { vkd.DestroyBuffer(d->device, d->flow_ext_buf[k], NULL); d->flow_ext_buf[k] = VK_NULL_HANDLE; }
-        if (d->flow_ext_mem[k]) { vkd.FreeMemory(d->device, d->flow_ext_mem[k], NULL); d->flow_ext_mem[k] = VK_NULL_HANDLE; }
-    }
-    d->flow_ext_texels = 0;
-    d->flow_ext_next = d->flow_ext_cur = 0;
-}
-
-static bool dis_alloc_flow_ext_one(VkrDis* d, uint32_t k, uint32_t texels) {
-    VkBufferCreateInfo bi;
-    memset(&bi, 0, sizeof bi);
-    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bi.size = (VkDeviceSize)texels * 8;    /* R32G32_SFLOAT, плотно */
-    bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    if (vkd.CreateBuffer(d->device, &bi, NULL, &d->flow_ext_buf[k]) != VK_SUCCESS) return false;
-    VkMemoryRequirements mr;
-    vkd.GetBufferMemoryRequirements(d->device, d->flow_ext_buf[k], &mr);
-    uint32_t mt = 0, found = 0;
-    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    for (uint32_t i = 0; i < d->mem_props.memoryTypeCount; i++) {
-        if ((mr.memoryTypeBits & (1u << i)) &&
-            (d->mem_props.memoryTypes[i].propertyFlags & want) == want) { mt = i; found = 1; break; }
-    }
-    if (!found) return false;
-    VkMemoryAllocateInfo ai;
-    memset(&ai, 0, sizeof ai);
-    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    ai.allocationSize = mr.size;
-    ai.memoryTypeIndex = mt;
-    if (vkd.AllocateMemory(d->device, &ai, NULL, &d->flow_ext_mem[k]) != VK_SUCCESS) return false;
-    if (vkd.BindBufferMemory(d->device, d->flow_ext_buf[k], d->flow_ext_mem[k], 0) != VK_SUCCESS) return false;
-    if (vkd.MapMemory(d->device, d->flow_ext_mem[k], 0, VK_WHOLE_SIZE, 0, &d->flow_ext_map[k]) != VK_SUCCESS ||
-        !d->flow_ext_map[k]) { d->flow_ext_map[k] = NULL; return false; }
-    return true;
-}
-
-/* Пересоздание кольца безопасно только при простаивающем GPU: размер потока меняется лишь в
- * vkr_dis_prepare, а рендерер перед пересборкой делает DeviceWaitIdle. */
-static bool dis_ensure_flow_ext_buf(VkrDis* d, uint32_t texels) {
-    if (d->flow_ext_buf[0] && d->flow_ext_texels >= texels) return true;
-    dis_free_flow_ext(d);
-    if (texels < 64u) return false;
-    for (uint32_t k = 0; k < DIS_EXT_RING; k++)
-        if (!dis_alloc_flow_ext_one(d, k, texels)) { dis_free_flow_ext(d); return false; }
-    d->flow_ext_texels = texels;
-    return true;
-}
-
-bool vkr_dis_flow_extent(const VkrDis* d, uint32_t* w, uint32_t* h) {
-    if (w) *w = 0;
-    if (h) *h = 0;
-    if (!d || !d->built || !d->built_extent.width || !d->built_extent.height) return false;
-    if (w) *w = d->built_extent.width;
-    if (h) *h = d->built_extent.height;
-    return true;
-}
-
-bool vkr_dis_supply_flow(VkrDis* d, const float* vectors, uint32_t grid_w, uint32_t grid_h,
-                          uint32_t full_w, uint32_t full_h) {
-    if (!d || !d->built) return false;
-    d->flow_ext_pending = false;
-    if (!vectors || !grid_w || !grid_h || full_w < 16u || full_h < 16u) return false;
-    const uint32_t fw = d->built_extent.width;
-    const uint32_t fh = d->built_extent.height;
-    if (!fw || !fh) return false;
-    if (!dis_ensure_flow_ext_buf(d, fw * fh)) { d->flow_ext_dropped++; return false; }
-    /* Пересчёт: вектора заданы на сетке блоков (grid) в пикселях полного кадра, прямые
-     * (ref -> target), в координатах содержимого (y вниз). Поле WFG живёт на разрешении
-     * потока (fw x fh) в его текселях: билинейно по центрам текселей, амплитуды
-     * масштабируются fw/full_w. Сетка слишком грубая (меньше 4 блоков) — считаем, что
-     * ME не справился: лучше DIS, чем поле из четырёх векторов. */
-    if (grid_w < 4u || grid_h < 4u) { d->flow_ext_dropped++; return false; }
-    const float sx = (float)fw / (float)full_w;
-    const float sy = (float)fh / (float)full_h;
-    const uint32_t wslot = d->flow_ext_next % DIS_EXT_RING;   /* не тот буфер, что читает GPU */
-    float* dst = (float*)d->flow_ext_map[wslot];
-    if (grid_w == fw && grid_h == fh) {
-        /* Сетка совпадает с потоком: ячейка = текстель, билинейный пересчёт тождественен
-         * (bx = i, by = j) - только масштаб амплитуд. Это убирает цикл ниже (~0.5 мс при 180p). */
-        const size_t n = (size_t)fw * fh;
-        for (size_t k = 0; k < n; k++) {
-            dst[2 * k]     = vectors[2 * k] * sx;
-            dst[2 * k + 1] = vectors[2 * k + 1] * sy;
-        }
-    } else {
-        for (uint32_t j = 0; j < fh; j++) {
-            const float Y = (j + 0.5f) * (float)full_h / (float)fh;        /* пиксели полного кадра */
-            const float by = Y * (float)grid_h / (float)full_h - 0.5f;    /* координата блока */
-            const int y0 = (int)floorf(by), y1 = y0 + 1;
-            const float ty = by - (float)y0;
-            const int cy0 = y0 < 0 ? 0 : y0;
-            const int cy1 = y1 > (int)grid_h - 1 ? (int)grid_h - 1 : y1;
-            for (uint32_t i = 0; i < fw; i++) {
-                const float X = (i + 0.5f) * (float)full_w / (float)fw;
-                const float bx = X * (float)grid_w / (float)full_w - 0.5f;
-                const int x0 = (int)floorf(bx), x1 = x0 + 1;
-                const float tx = bx - (float)x0;
-                const int cx0 = x0 < 0 ? 0 : x0;
-                const int cx1 = x1 > (int)grid_w - 1 ? (int)grid_w - 1 : x1;
-                const float* v00 = vectors + 2 * ((size_t)cy0 * grid_w + (size_t)cx0);
-                const float* v01 = vectors + 2 * ((size_t)cy0 * grid_w + (size_t)cx1);
-                const float* v10 = vectors + 2 * ((size_t)cy1 * grid_w + (size_t)cx0);
-                const float* v11 = vectors + 2 * ((size_t)cy1 * grid_w + (size_t)cx1);
-                const size_t o = 2 * ((size_t)j * fw + (size_t)i);
-                const float a = (1.0f - tx) * (1.0f - ty);
-                const float b = tx * (1.0f - ty);
-                const float c = (1.0f - tx) * ty;
-                const float e = tx * ty;
-                dst[o]     = (v00[0] * a + v01[0] * b + v10[0] * c + v11[0] * e) * sx;
-                dst[o + 1] = (v00[1] * a + v01[1] * b + v10[1] * c + v11[1] * e) * sy;
-            }
-        }
-    }
-    d->flow_ext_cur = wslot;
-    d->flow_ext_next = wslot + 1u;
-    d->flow_ext_pending = true;
-    return true;
-}
-
-/* P0: счётчики внешнего поля для строки статистики (me=used/dropped): сколько поданных полей
- * реально потреблено генерацией и сколько потеряно (отказ supply: нет памяти/грубая сетка;
- * сгорело на кадре без генерации). used+dropped — все судьбы поданных полей. */
-void vkr_dis_flow_stats(const VkrDis* d, uint64_t* ext_used, uint64_t* ext_dropped) {
-    if (ext_used) *ext_used = d ? d->flow_ext_used : 0;
-    if (ext_dropped) *ext_dropped = d ? d->flow_ext_dropped : 0;
 }
