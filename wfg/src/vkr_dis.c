@@ -2736,6 +2736,15 @@ static bool dis_ensure_flow_ext_buf(VkrDis* d, uint32_t texels) {
     return true;
 }
 
+bool vkr_dis_flow_extent(const VkrDis* d, uint32_t* w, uint32_t* h) {
+    if (w) *w = 0;
+    if (h) *h = 0;
+    if (!d || !d->built || !d->built_extent.width || !d->built_extent.height) return false;
+    if (w) *w = d->built_extent.width;
+    if (h) *h = d->built_extent.height;
+    return true;
+}
+
 bool vkr_dis_supply_flow(VkrDis* d, const float* vectors, uint32_t grid_w, uint32_t grid_h,
                           uint32_t full_w, uint32_t full_h) {
     if (!d || !d->built) return false;
@@ -2755,31 +2764,41 @@ bool vkr_dis_supply_flow(VkrDis* d, const float* vectors, uint32_t grid_w, uint3
     const float sy = (float)fh / (float)full_h;
     const uint32_t wslot = d->flow_ext_next % DIS_EXT_RING;   /* не тот буфер, что читает GPU */
     float* dst = (float*)d->flow_ext_map[wslot];
-    for (uint32_t j = 0; j < fh; j++) {
-        const float Y = (j + 0.5f) * (float)full_h / (float)fh;        /* пиксели полного кадра */
-        const float by = Y * (float)grid_h / (float)full_h - 0.5f;    /* координата блока */
-        const int y0 = (int)floorf(by), y1 = y0 + 1;
-        const float ty = by - (float)y0;
-        const int cy0 = y0 < 0 ? 0 : y0;
-        const int cy1 = y1 > (int)grid_h - 1 ? (int)grid_h - 1 : y1;
-        for (uint32_t i = 0; i < fw; i++) {
-            const float X = (i + 0.5f) * (float)full_w / (float)fw;
-            const float bx = X * (float)grid_w / (float)full_w - 0.5f;
-            const int x0 = (int)floorf(bx), x1 = x0 + 1;
-            const float tx = bx - (float)x0;
-            const int cx0 = x0 < 0 ? 0 : x0;
-            const int cx1 = x1 > (int)grid_w - 1 ? (int)grid_w - 1 : x1;
-            const float* v00 = vectors + 2 * ((size_t)cy0 * grid_w + (size_t)cx0);
-            const float* v01 = vectors + 2 * ((size_t)cy0 * grid_w + (size_t)cx1);
-            const float* v10 = vectors + 2 * ((size_t)cy1 * grid_w + (size_t)cx0);
-            const float* v11 = vectors + 2 * ((size_t)cy1 * grid_w + (size_t)cx1);
-            const size_t o = 2 * ((size_t)j * fw + (size_t)i);
-            const float a = (1.0f - tx) * (1.0f - ty);
-            const float b = tx * (1.0f - ty);
-            const float c = (1.0f - tx) * ty;
-            const float e = tx * ty;
-            dst[o]     = (v00[0] * a + v01[0] * b + v10[0] * c + v11[0] * e) * sx;
-            dst[o + 1] = (v00[1] * a + v01[1] * b + v10[1] * c + v11[1] * e) * sy;
+    if (grid_w == fw && grid_h == fh) {
+        /* Сетка совпадает с потоком: ячейка = текстель, билинейный пересчёт тождественен
+         * (bx = i, by = j) - только масштаб амплитуд. Это убирает цикл ниже (~0.5 мс при 180p). */
+        const size_t n = (size_t)fw * fh;
+        for (size_t k = 0; k < n; k++) {
+            dst[2 * k]     = vectors[2 * k] * sx;
+            dst[2 * k + 1] = vectors[2 * k + 1] * sy;
+        }
+    } else {
+        for (uint32_t j = 0; j < fh; j++) {
+            const float Y = (j + 0.5f) * (float)full_h / (float)fh;        /* пиксели полного кадра */
+            const float by = Y * (float)grid_h / (float)full_h - 0.5f;    /* координата блока */
+            const int y0 = (int)floorf(by), y1 = y0 + 1;
+            const float ty = by - (float)y0;
+            const int cy0 = y0 < 0 ? 0 : y0;
+            const int cy1 = y1 > (int)grid_h - 1 ? (int)grid_h - 1 : y1;
+            for (uint32_t i = 0; i < fw; i++) {
+                const float X = (i + 0.5f) * (float)full_w / (float)fw;
+                const float bx = X * (float)grid_w / (float)full_w - 0.5f;
+                const int x0 = (int)floorf(bx), x1 = x0 + 1;
+                const float tx = bx - (float)x0;
+                const int cx0 = x0 < 0 ? 0 : x0;
+                const int cx1 = x1 > (int)grid_w - 1 ? (int)grid_w - 1 : x1;
+                const float* v00 = vectors + 2 * ((size_t)cy0 * grid_w + (size_t)cx0);
+                const float* v01 = vectors + 2 * ((size_t)cy0 * grid_w + (size_t)cx1);
+                const float* v10 = vectors + 2 * ((size_t)cy1 * grid_w + (size_t)cx0);
+                const float* v11 = vectors + 2 * ((size_t)cy1 * grid_w + (size_t)cx1);
+                const size_t o = 2 * ((size_t)j * fw + (size_t)i);
+                const float a = (1.0f - tx) * (1.0f - ty);
+                const float b = tx * (1.0f - ty);
+                const float c = (1.0f - tx) * ty;
+                const float e = tx * ty;
+                dst[o]     = (v00[0] * a + v01[0] * b + v10[0] * c + v11[0] * e) * sx;
+                dst[o + 1] = (v00[1] * a + v01[1] * b + v10[1] * c + v11[1] * e) * sy;
+            }
         }
     }
     d->flow_ext_cur = wslot;

@@ -81,6 +81,10 @@ void vkr_dis_reset(VkrDis* dis);
  * vkr_dis_process() uses it and clears the request. Call between vkr_dis_prepare() and
  * vkr_dis_process(). Returns false if the engine is not built (the field is dropped).
  * Passing NULL/0 clears any pending request (the pair falls back to DIS). */
+/* Flow resolution the engine is currently built for (what vkr_dis_supply_flow resamples to).
+ * A grid of exactly this size is taken as is (no resampling). false: engine not built, w = h = 0. */
+bool vkr_dis_flow_extent(const VkrDis* dis, uint32_t* w, uint32_t* h);
+
 bool vkr_dis_supply_flow(VkrDis* dis, const float* vectors, uint32_t grid_w, uint32_t grid_h,
                           uint32_t full_w, uint32_t full_h);
 

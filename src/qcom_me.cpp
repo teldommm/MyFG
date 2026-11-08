@@ -84,7 +84,14 @@ typedef void (*PFN_glBindImageTexture_fn)(GLuint, GLuint, GLint, GLboolean, GLen
 typedef void (*PFN_glMemoryBarrier_fn)(GLbitfield);
 typedef void (*PFN_glBindSampler_fn)(GLuint, GLuint);
 
-// ---- импорты игрового буфера (кэш по указателю, lru 4) ------------------------------------
+// ---- импорты игрового буфера (кэш по указателю, lru kCache) ---------------------------------
+// Кольцо буферов игры бывает 3–5 штук: при кэше меньше кольца LRU вытесняет ровно тот буфер,
+// что понадобится следующим, и EGLImage + текстура пересоздаются каждый кадр.
+constexpr int kCache = 8;
+// Сетка потока WFG больше этого числа текселей не используется для выхода refine: readback
+// растёт как fw*fh*16 байт (RGBA float), и выше порога возвращаемся к блочной сетке ME.
+constexpr int64_t kMaxFlowGrid = 262144;   // ~ 512x512 (flow_side до ~400 при 16:10)
+
 struct ExtTex {
     AHardwareBuffer* ahb = nullptr;    // с нашей ссылкой
     EGLImageKHR img = EGL_NO_IMAGE_KHR;
@@ -131,10 +138,14 @@ struct Me {
     GLuint fboLuma = 0, fboRead = 0;
     int lumaW = 0, lumaH = 0;
     int moW = 0, moH = 0;
-    std::vector<float> halfBuf;                      // RGBA16F readback (как GL_FLOAT)
-    std::vector<float> vecBuf;                       // x,y на блок — наружу
-    ExtTex cache[4];
+    std::vector<float> halfBuf;                      // RGBA16F readback (как GL_FLOAT), outW*outH*4
+    std::vector<float> vecBuf;                       // x,y на ячейку сетки — наружу, outW*outH*2
+    ExtTex cache[kCache];
     uint64_t tick = 0;
+    // статистика кадра ME (снимается раз в интервал лога через takeStats)
+    uint64_t stFrames = 0;
+    double stTotMs = 0, stFinMs = 0, stMaxMs = 0;
+    int lastOutW = 0, lastOutH = 0;                  // для лога смены сетки
 
     void fail(const char* why) {
         if (ready || !failedReasonLogged) LOGW("qcom-me: %s (DIS stays the flow solver)", why);
@@ -154,7 +165,7 @@ void dropExt(ExtTex& e) {
 ExtTex* importAhb(AHardwareBuffer* ahb) {
     int slot = -1;
     uint64_t minUse = ~0ull;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < kCache; i++) {
         ExtTex& e = g.cache[i];
         if (e.ahb == ahb && e.img != EGL_NO_IMAGE_KHR) { e.use = ++g.tick; return &e; }
         if (!e.ahb) { slot = i; break; }             // свободный — лучше всего
@@ -394,11 +405,13 @@ const char* kRefineBody =
     "    imageStore(uMvOut, id, vec4(bestMv, clamp(gz, 0.25, 4.0), 1.0));\n"
     "}\n";
 
-// ---- блочная редукция уточнённого поля в сетку ME (WFG ждёт блоки) ---------------------------
-// Вход — half-res поле (w/2 x h/2, MV в half-res пикселях): блок ME (blockX x blockY пикселей
-// luma) занимает на half-res сетке (blockX/2) x (blockY/2) текселей; 16 отсчётов 4x4 по блоку
-// + центр -> медиана 17, вектора умножаются на 2 (half-res px -> пиксели luma). Выход — сетка
-// mw x mh в пикселях luma: дальше readback и kx/ky — как для сырого аппаратного поля.
+// ---- редукция уточнённого поля в сетку выхода (WFG принимает любую сетку) ---------------------
+// Вход — half-res поле (w/2 x h/2, MV в half-res пикселях). Ячейка выхода покрывает
+// uBlockSize пикселей luma (дробное: w/outW x h/outH) = uBlockSize/2 текселей half-res; 16
+// отсчётов 4x4 по ячейке + центр -> медиана 17, вектора умножаются на 2 (half-res px ->
+// пиксели luma). Выход — сетка outW x outH в пикселях luma. Сетка либо блочная (mw x mh, когда
+// сетка потока WFG недоступна), либо РАЗМЕРА ПОТОКА WFG (fw x fh): тогда vkr_dis_supply_flow
+// не пересэмплирует поле (тождественный путь), а разрешение refine не пропадает впустую.
 const char* kReduceBody =
     "layout(local_size_x=8, local_size_y=8) in;\n"
     "precision highp float;\n"
@@ -719,10 +732,19 @@ bool ensure() {
     return true;
 }
 
+Stats takeStats() {
+    Stats s;
+    s.frames = g.stFrames; s.avgMs = g.stFrames ? g.stTotMs / (double)g.stFrames : 0.0;
+    s.avgStallMs = g.stFrames ? g.stFinMs / (double)g.stFrames : 0.0; s.maxMs = g.stMaxMs;
+    g.stFrames = 0; g.stTotMs = g.stFinMs = g.stMaxMs = 0.0;
+    return s;
+}
+
 bool frame(AHardwareBuffer* ahb, int fence_fd, int cl, int ct, int cr, int cb, int bw, int bh,
-           const float** vec, uint32_t* gw, uint32_t* gh) {
+           int flowW, int flowH, const float** vec, uint32_t* gw, uint32_t* gh) {
     *vec = nullptr; *gw = *gh = 0;
     if (!g.ready) return false;
+    const int64_t tStart = now_ns();
     if (!ahb) { g.havePrev = g.temporalValid = false; return false; }
     if (bw < 256 || bh < 256) { g.havePrev = g.temporalValid = false; return false; }   // ME на мелком окне не имеет смысла
 
@@ -742,8 +764,6 @@ bool frame(AHardwareBuffer* ahb, int fence_fd, int cl, int ct, int cr, int cb, i
         }
         glBindTexture(GL_TEXTURE_2D, g.motionTex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, mw, mh, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
-        g.halfBuf.assign((size_t)mw * mh * 4, 0.0f);
-        g.vecBuf.assign((size_t)mw * mh * 2, 0.0f);
     }
 
     ExtTex* ext = importAhb(ahb);
@@ -789,19 +809,28 @@ bool frame(AHardwareBuffer* ahb, int fence_fd, int cl, int ct, int cr, int cb, i
     // CLAMP_TO_EDGE на краю, MV-масштаб (x0.5/x2) от этого не зависят.
     GLuint readTex = g.motionTex;
     bool refined = false;
+    int outW = mw, outH = mh;             // сетка, которая уйдёт наружу: блочная (сырое поле) или сетка потока WFG
     const int mode = g_cfg.me_refine;
     const int w2 = w / 2, h2 = h / 2;
     if ((mode == 1 || mode == 2) && g.progRefine[mode] && g.progReduce && g.mvFull[0] && g.mvFull[1] && g.motionClean) {
-        if (g.fullW != w2 || g.fullH != h2 || g.cleanW != mw || g.cleanH != mh) {
-            // хранилища уточнения (лениво: me_refine могли включить после старта ME)
-            g.fullW = w2; g.fullH = h2; g.cleanW = mw; g.cleanH = mh;
+        // Сетка выхода refine = сетка потока WFG (если известна и не слишком велика): supply_flow
+        // тогда не пересэмплирует поле, а разрешение refine не теряется на блочной редукции.
+        int ow = mw, oh = mh;
+        if (flowW >= 4 && flowH >= 4 && (int64_t)flowW * flowH <= kMaxFlowGrid) { ow = flowW; oh = flowH; }
+        if (g.fullW != w2 || g.fullH != h2) {
+            // хранилище попиксельного поля (лениво: me_refine могли включить после старта ME)
+            g.fullW = w2; g.fullH = h2;
             g.temporalValid = false;
             for (int i = 0; i < 2; i++) {
                 glBindTexture(GL_TEXTURE_2D, g.mvFull[i]);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, w2, h2, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
             }
+        }
+        if (g.cleanW != ow || g.cleanH != oh) {
+            // выходная сетка меняется при смене flow_side (governor): временное поле от этого не страдает
+            g.cleanW = ow; g.cleanH = oh;
             glBindTexture(GL_TEXTURE_2D, g.motionClean);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, mw, mh, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, ow, oh, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
         }
         glUseProgram(g.progRefine[mode]);
         glActiveTexture(GL_TEXTURE0);
@@ -832,10 +861,10 @@ bool frame(AHardwareBuffer* ahb, int fence_fd, int cl, int ct, int cr, int cb, i
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g.mvFull[g.fullSlot]);
         if (g.bindSampler) g.bindSampler(0, 0);
-        glUniform2f(g.ruBlockSize, (float)g.blockX, (float)g.blockY);
-        glUniform2f(g.ruOutSize, (float)mw, (float)mh);
+        glUniform2f(g.ruBlockSize, (float)w / (float)g.cleanW, (float)h / (float)g.cleanH);   // luma px на ячейку выхода
+        glUniform2f(g.ruOutSize, (float)g.cleanW, (float)g.cleanH);
         g.bindImage(0, g.motionClean, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
-        g.dispatchCompute((GLuint)((mw + 7) / 8), (GLuint)((mh + 7) / 8), 1);
+        g.dispatchCompute((GLuint)((g.cleanW + 7) / 8), (GLuint)((g.cleanH + 7) / 8), 1);
         g.memoryBarrier(0xFFFFFFFFu);
         g.bindImage(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);   // отвязать image перед readback
         glActiveTexture(GL_TEXTURE0);
@@ -847,14 +876,24 @@ bool frame(AHardwareBuffer* ahb, int fence_fd, int cl, int ct, int cr, int cb, i
             g.progRefine[1] = g.progRefine[2] = g.progReduce = 0;
         } else {
             readTex = g.motionClean;
+            outW = g.cleanW; outH = g.cleanH;
             refined = true;
         }
     }
+    if (outW != g.lastOutW || outH != g.lastOutH) {
+        g.lastOutW = outW; g.lastOutH = outH;
+        LOGD("qcom-me: output grid %dx%d (%s), ME block grid %dx%d", outW, outH,
+             refined ? (outW == mw && outH == mh ? "refined, block grid" : "refined, flow resolution") : "raw hardware field", mw, mh);
+    }
+    if (g.halfBuf.size() < (size_t)outW * outH * 4) g.halfBuf.resize((size_t)outW * outH * 4);
+    if (g.vecBuf.size() < (size_t)outW * outH * 2) g.vecBuf.resize((size_t)outW * outH * 2);
 
+    const int64_t tFin0 = now_ns();
     glFinish();                           // вектора нужны на CPU: блокирует поток конвейера до конца ME+refine на GPU
+    const int64_t tFin1 = now_ns();
     glBindFramebuffer(GL_FRAMEBUFFER, g.fboRead);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, readTex, 0);
-    glReadPixels(0, 0, mw, mh, GL_RGBA, GL_FLOAT, g.halfBuf.data());   // (RGBA, FLOAT) гарантирован для float-таргета
+    glReadPixels(0, 0, outW, outH, GL_RGBA, GL_FLOAT, g.halfBuf.data());   // (RGBA, FLOAT) гарантирован для float-таргета
     glBindFramebuffer(GL_FRAMEBUFFER, g.fboLuma);
     if (glGetError() != GL_NO_ERROR) { g.fail("GL error in readback"); g.havePrev = g.temporalValid = false; return false; }
 
@@ -865,7 +904,7 @@ bool frame(AHardwareBuffer* ahb, int fence_fd, int cl, int ct, int cr, int cb, i
     const float ky = (float)(cb - ct) / (float)h;
     const float dysRead = readTex == g.motionTex ? dys : 1.0f;   // сырое поле — флип; уточнённое уже контентное
     // не-конечные (их не бывает по спеке, но драйверы разные) — нули
-    for (size_t k = 0; k < (size_t)g.moW * g.moH; k++) {
+    for (size_t k = 0; k < (size_t)outW * outH; k++) {
         const size_t s = k * 4, d = k * 2;
         const float x = g.halfBuf[s];
         const float y = g.halfBuf[s + 1];
@@ -876,7 +915,13 @@ bool frame(AHardwareBuffer* ahb, int fence_fd, int cl, int ct, int cr, int cb, i
     if (refined) { g.fullSlot = 1 - g.fullSlot; g.temporalValid = true; }
     else g.temporalValid = false;
     *vec = g.vecBuf.data();
-    *gw = (uint32_t)mw; *gh = (uint32_t)mh;
+    *gw = (uint32_t)outW; *gh = (uint32_t)outH;
+    const int64_t tEnd = now_ns();
+    const double totMs = (double)(tEnd - tStart) / 1e6;
+    g.stFrames++;
+    g.stTotMs += totMs;
+    g.stFinMs += (double)(tFin1 - tFin0) / 1e6;
+    if (totMs > g.stMaxMs) g.stMaxMs = totMs;
     return true;
 }
 

@@ -1589,7 +1589,11 @@ private:
             else {
                 const float* mv = nullptr;
                 uint32_t mgw = 0, mgh = 0;
-                if (qcomMe::frame(j.src, meFence, j.cl, j.ct, j.cr, j.cb, (int)j.bw, (int)j.bh, &mv, &mgw, &mgh))
+                // сетка потока WFG: refine отдаёт поле сразу на ней, supply_flow его не пересэмплирует
+                uint32_t flw = 0, flh = 0;
+                vkr_dis_flow_extent(wfg_, &flw, &flh);
+                if (qcomMe::frame(j.src, meFence, j.cl, j.ct, j.cr, j.cb, (int)j.bw, (int)j.bh,
+                                  (int)flw, (int)flh, &mv, &mgw, &mgh))
                     // full_w/h — контент (вектора в его пикселях): масштаб и сетка считаются от него
                     vkr_dis_supply_flow(wfg_, mv, mgw, mgh, (uint32_t)(j.cr - j.cl), (uint32_t)(j.cb - j.ct));
             }
@@ -1825,6 +1829,11 @@ private:
             if (o < sizeof ex - 32)
                 o += (size_t)snprintf(ex + o, sizeof ex - o, " me=%llu/%llu",
                                       (unsigned long long)mu, (unsigned long long)md);
+            // время ME (GL-контекст, в gpu= не входит): среднее/максимум frame() и среднее ожидание glFinish
+            const qcomMe::Stats ms = qcomMe::takeStats();
+            if (ms.frames && o < sizeof ex - 48)
+                o += (size_t)snprintf(ex + o, sizeof ex - o, " meT=%.1f/%.1fms stall=%.1f",
+                                      ms.avgMs, ms.maxMs, ms.avgStallMs);
         }
         char gv[64] = "";
         if (gov_level_ > 0) snprintf(gv, sizeof gv, " gov=%d", gov_level_);
