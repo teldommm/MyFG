@@ -18,6 +18,7 @@ MyFG injects into the game process, captures its frames, builds intermediate fra
 - **WFG optical flow** (DIS on Vulkan compute) — the interpolation core.
 - **PTS-phase interpolation** and vsync alignment (AChoreographer) for smooth frame pacing.
 - **Output via `ASurfaceControl`** — a child layer above the game window.
+- **Source classes:** video (MediaCodec) > game / remote render > the app's own UI window (HWUI, off by default: `ui_source`). Frames that arrive over Binder (video, a browser GPU process drawing into a `SurfaceView`) get their window from `BLASTBufferQueue` (`hook_bbq`), so the overlay sits exactly on the `SurfaceView` under the app UI. DRM (`PROTECTED_CONTENT`) frames are never captured.
 - **Frame multiplier** x2–x4 (up to 7 generated frames per game frame), auto-selected from the display refresh rate.
 - **Adaptive load:** when the GPU is overloaded, the module lowers the flow resolution first, then the number of generated frames.
 - **Thermal throttling** based on battery temperature.
@@ -99,6 +100,7 @@ MyFG внедряется в процесс игры, перехватывает
 - **Оптический поток WFG** (DIS на Vulkan compute) — ядро интерполяции.
 - **PTS-фазовая интерполяция** и привязка к vsync (AChoreographer) для ровного фрейм-пейсинга.
 - **Вывод через `ASurfaceControl`** — дочерний слой поверх окна игры.
+- **Классы источников:** видео (MediaCodec) > игра / удалённый рендер > собственное окно приложения (HWUI, по умолчанию выкл.: `ui_source`). Кадры, пришедшие по Binder (видео, GPU-процесс браузера в `SurfaceView`), получают окно из `BLASTBufferQueue` (`hook_bbq`): оверлей встаёт ровно на `SurfaceView` под интерфейсом приложения. Защищённые (DRM, `PROTECTED_CONTENT`) кадры не захватываются.
 - **Множитель кадров** x2–x4 (до 7 сгенерированных кадров на кадр игры), автоподбор по частоте дисплея.
 - **Адаптивная нагрузка:** при перегрузе GPU сначала снижается разрешение потока, затем число генерируемых кадров.
 - **Термо-троттлинг** по температуре батареи.

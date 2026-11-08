@@ -37,6 +37,9 @@ bool electedSize(int* w, int* h);
 ANativeWindow* electedWindow();
 // true — хук android::Surface::*queueBuffer установлен (окно/буфер/fence приходят оттуда).
 bool surfaceHooked();
+// true — выбранный источник приходит через Binder (видео, GPU-процесс браузера): его окно известно только из BLAST,
+// эвристика «последнее окно приложения» к нему неприменима (иначе оверлей лёг бы поверх всего UI).
+bool electedRemote();
 // ---- запасные пути захвата (fallback_egl.cpp / fallback_vk.cpp) ---------------------------------
 // true — BufferQueue-путь отдавал кадры в последние ~1.5 с: запасные пути в это время молчат.
 bool bqActive();
@@ -52,6 +55,6 @@ void extSubmit(Job& j);
 // Прекращает захват (конвейер не поднялся): игра идёт как без модуля.
 void disable();
 // Статистика.
-struct Stats { uint64_t queue_calls, requested, attached, queued, submitted, dropped_job, rejected_fmt, slot_miss, surf_calls; };
+struct Stats { uint64_t queue_calls, requested, attached, queued, submitted, dropped_job, rejected_fmt, slot_miss, surf_calls, rejected_prot; };
 Stats stats();
 }

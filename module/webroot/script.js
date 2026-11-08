@@ -87,6 +87,8 @@ const SCHEMA = [
     { k: 'target_w',  t: 'num',  def: 0, min: 0, max: 16384, step: 16, unit: 'px', icon: '↔️', z: 'z_auto' },
     { k: 'target_h',  t: 'num',  def: 0, min: 0, max: 16384, step: 16, unit: 'px', icon: '↕️', z: 'z_auto' },
     { k: 'elect_blast', t: 'bool', def: 1, icon: '🧭' },
+    { k: 'hook_bbq', t: 'bool', def: 1, icon: '🎞️' },
+    { k: 'ui_source', t: 'bool', def: 0, icon: '🪟' },
     { k: 'hook_swap',    t: 'mode', def: 1, icon: '🧩' },
     { k: 'hook_present', t: 'mode', def: 1, icon: '🧩' },
     { k: 'fallback_ms',  t: 'num',  def: 10000, min: 1000, max: 120000, step: 1000, unit: 'ms', icon: '⏲️', dep: [['hook_swap', '=', 1], ['hook_present', '=', 1]] },
@@ -185,6 +187,8 @@ ru: {
   k_use_oncomplete: 'Освобождение по onComplete', d_use_oncomplete: 'Буфер свободен, когда SurfaceFlinger отдал его; выкл — по «Удержанию буферов»',
   k_layer_tf: 'Поворот слоя', d_layer_tf: 'Если картинка повёрнута или отражена (игры с pre-rotation) — выберите угол или зеркало. «Из игры» — по умолчанию',
   k_elect_blast: 'Подсказки BLASTBufferQueue', d_elect_blast: 'Размеры окон из BLASTBufferQueue помогают выбрать игровую очередь (хук при запуске)',
+  k_hook_bbq: 'Окно видео через BLAST', d_hook_bbq: 'Видео и кадры из GPU-процесса (Binder): слой оверлея встаёт ровно на SurfaceView и остаётся под интерфейсом. Выкл. — такие источники не обрабатываются',
+  k_ui_source: 'Окно приложения как источник', d_ui_source: 'Разрешить брать кадры интерфейса приложения (HWUI). Обычно не нужно: закрывает видео чёрным прямоугольником',
   k_hook_swap: 'Запасной захват: eglSwapBuffers', d_hook_swap: 'GLES-игры, если BufferQueue не отдаёт кадры. «Запасной» — включается через время ниже; «Всегда» — хук ставится сразу. Хук — при запуске',
   k_hook_present: 'Запасной захват: vkQueuePresentKHR', d_hook_present: 'Vulkan-игры. Хук vkCreateDevice должен стоять до создания устройства: «Запасной» — только если BufferQueue-хуки не встали, «Всегда» — всегда. Применяется при запуске',
   k_fallback_ms: 'Включать запасной захват через', d_fallback_ms: 'Сколько мс без кадров от BufferQueue после старта; запасной путь молчит, пока BufferQueue работает',
@@ -308,6 +312,8 @@ en: {
   k_use_oncomplete: 'Release via onComplete', d_use_oncomplete: 'A buffer is free once SurfaceFlinger returned it; off = by “Buffer hold”',
   k_layer_tf: 'Layer rotation', d_layer_tf: 'If the picture appears rotated or mirrored (pre-rotating games) pick an angle or a flip. “From game” is the default',
   k_elect_blast: 'BLASTBufferQueue hints', d_elect_blast: 'Window sizes from BLASTBufferQueue help pick the game queue (hook at launch)',
+  k_hook_bbq: 'Video window via BLAST', d_hook_bbq: 'Video and frames from a GPU process (Binder): the overlay layer attaches exactly to the SurfaceView and stays under the app UI. Off - such sources are ignored',
+  k_ui_source: 'App window as source', d_ui_source: 'Allow capturing the app UI window (HWUI). Usually not wanted: it covers video with a black rectangle',
   k_hook_swap: 'Fallback capture: eglSwapBuffers', d_hook_swap: 'GLES games when BufferQueue yields no frames. “Fallback” arms after the delay below; “Always” installs the hook at once. Hook at launch',
   k_hook_present: 'Fallback capture: vkQueuePresentKHR', d_hook_present: 'Vulkan games. The vkCreateDevice hook must be in place before the device exists: “Fallback” = only if the BufferQueue hooks failed, “Always” = always. Applied at launch',
   k_fallback_ms: 'Arm fallback capture after', d_fallback_ms: 'Milliseconds without BufferQueue frames after launch; the fallback stays silent while BufferQueue works',
@@ -678,9 +684,9 @@ function resetBtn(k) {
 const iconBox = ic => h('span', { class: 'tu-row-icon', text: ic });
 // Ключи, которые игра читает только при запуске (хуки, очередь, создание устройства): в live-обновление
 // не входят (Config::applyLive в config.cpp). Под такими настройками показывается пометка.
-// target_w/target_h/elect_blast читаются на каждом кадре и применяются на ходу (см. applyLive).
+// target_w/target_h/elect_blast/ui_source читаются на каждом кадре и применяются на ходу (см. applyLive).
 const RESTART_KEYS = new Set(['hook_surface', 'hook_egl', 'hook_anw', 'hook_vk', 'hook_swap', 'hook_present', 'hook_delay_ms',
-  'fallback_ms', 'queue_prio']);
+  'fallback_ms', 'queue_prio', 'hook_bbq']);
 const textBox = (label, desc) => {
   const dk = label && label.dataset ? label.dataset.i18n : '';
   const key = dk && dk.startsWith('k_') ? dk.slice(2) : '';

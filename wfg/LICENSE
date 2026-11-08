@@ -26,4 +26,4 @@ The algorithms implemented here come from published work and their reference cod
 Dense Inverse Search optical flow (Till Kroeger et al., OF_DIS; OpenCV DISOpticalFlow) and
 Farneback's polynomial-expansion optical flow (OpenCV optflowgf.cpp). OpenCV is licensed under
 the Apache License 2.0: https://github.com/opencv/opencv/blob/4.x/LICENSE
-See CREDITS.md in WinNative (https://github.com/WinNative-Emu/WinNative) for the full attribution.
+

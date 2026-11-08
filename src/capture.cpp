@@ -30,6 +30,7 @@
 #include <mutex>
 #include <pthread.h>
 #include <stdlib.h>
+#include <sys/prctl.h>
 #include <string.h>
 #include <thread>
 #include <unistd.h>
@@ -69,9 +70,26 @@ BlastHint g_blast[4];
 std::atomic<uint32_t> g_blast_i{0};
 std::atomic<uint64_t> g_blast_calls{0};
 
+// ---- классы источников -------------------------------------------------------------------
+// Кадры в процессе приложения идут из разных очередей: игра/видео (то, что нужно) и окно самого приложения
+// (HWUI, поток "RenderThread": тулбары, меню и прозрачная «дыра» под SurfaceView). Раньше побеждала очередь
+// с большей площадью, и окно HWUI перебивало видео при каждой анимации интерфейса. Теперь у очереди есть
+// приоритет: видео (кадры из MediaCodec, явный timestamp) > игра/удалённый рендер > окно приложения.
+constexpr int kScoreUi = 1, kScoreGame = 2, kScoreVideo = 3;
+std::atomic<int>  g_elected_score{0};
+std::atomic<bool> g_elected_remote{false};  // источник приходит через Binder: окно можно получить только из BLAST
+std::atomic<int64_t> g_remote_seen_ns{0};   // когда впервые увидели такой источник (для предупреждения в логе)
+std::atomic<bool> g_remote_warned{false};
+
+struct Cls { void* self = nullptr; int score = 0; bool ui = false; bool remote = false; const char* kind = ""; int64_t last = 0; };
+// ui_source меняется на ходу, поэтому оценка окна приложения считается в момент использования
+int score_of(const Cls& c) { return c.ui ? (g_cfg.ui_source ? kScoreUi : 0) : c.score; }
+Cls g_cls[8];
+std::mutex g_clsm;
+
 std::atomic<int> g_fence_bad{0};
 std::atomic<uint64_t> g_requested{0}, g_attached{0}, g_queue_calls{0}, g_surf_calls{0};
-std::atomic<uint64_t> g_queued{0}, g_submitted{0}, g_dropped_job{0}, g_rejected_fmt{0}, g_miss{0};
+std::atomic<uint64_t> g_queued{0}, g_submitted{0}, g_dropped_job{0}, g_rejected_fmt{0}, g_miss{0}, g_rejected_prot{0};
 
 int (*orig_queue)(void*, int, const void*, void*) = nullptr;
 int (*orig_request)(void*, int, void*) = nullptr;
@@ -111,6 +129,148 @@ AHardwareBuffer* ahb_from_anb(void* anb) {
         }
     }
     return nullptr;
+}
+
+// ---- окно удалённого источника (видео, GPU-процесс браузера) --------------------------------
+// queueBuffer приходит на binder-потоке, Surface-хук там не срабатывает и окна нет. Но очередь SurfaceView —
+// это BLASTBufferQueue приложения: он вызывает onFrameAvailable синхронно изнутри queueBuffer, на том же
+// потоке. В этом хуке BBQ заведомо жив; BLASTBufferQueue::getSurface(true) отдаёт Surface со ссылкой на
+// слой SurfaceView — ровно то, что нужно ASurfaceControl_createFromWindow (родитель = getSurfaceControlHandle()).
+struct SpOut { void* p; SpOut() : p(nullptr) {} ~SpOut() {} };   // как android::sp<T>: нетривиальный dtor -> возврат через x8
+typedef SpOut (*PFN_bbqGetSurface)(void* bbq, bool includeSurfaceControlHandle);
+PFN_bbqGetSurface bbq_get_surface = nullptr;
+void (*orig_bbq_frame)(void*, const void*) = nullptr;
+std::atomic<bool> g_bbq_hooked{false}, g_bbq_tried{false};
+std::atomic<int> g_anw_off{-1}, g_bbq_fail{0};
+pthread_key_t g_bbq_key;
+bool g_bbq_key_ok = false;
+struct BbqCtx { void* self; };
+
+struct WinEnt { void* self = nullptr; void* bbq = nullptr; ANativeWindow* win = nullptr; int64_t last = 0; };
+WinEnt g_we[8];
+std::mutex g_wem;
+
+// Окно, найденное для producer'а, с взятой ссылкой (вызывающий делает ANativeWindow_release). nullptr — не найдено.
+ANativeWindow* win_cached_acquire(void* self) {
+    std::lock_guard<std::mutex> g(g_wem);
+    for (auto& e : g_we)
+        if (e.self == self && e.win) { e.last = now_ns(); ANativeWindow_acquire(e.win); return e.win; }
+    return nullptr;
+}
+
+void resolve_bbq_window(void* self, void* bbq) {
+    {
+        std::lock_guard<std::mutex> g(g_wem);
+        for (auto& e : g_we)
+            if (e.self == self && e.bbq == bbq && e.win) { e.last = now_ns(); return; }     // уже известно
+    }
+    if (!bbq_get_surface || !bbq) return;
+    if (g_bbq_fail.load() >= 3) return;               // формат ответа не распознан: не плодим объекты на каждый кадр
+    SpOut r = bbq_get_surface(bbq, true);
+    void* sp = r.p;                                   // +1 ссылка из sp<Surface> переходит нам (dtor пустой)
+    if (!sp) return;
+    // sp<Surface> указывает на Surface, а не на ANativeWindow: у Surface первым идёт RefBase (vptr + счётчики, 16 байт),
+    // ANativeWindow лежит следом (+0x10) — тот же сдвиг, что у GraphicBuffer/ANativeWindowBuffer. Смещение подбираем
+    // по магии окна и запоминаем; ANativeWindow_release по смещённому указателю снимает ссылку с Surface.
+    int off = g_anw_off.load();
+    if (off < 0) {
+        static const int kTry[] = {0x10, 0, 0x8, 0x18, 0x20, 0x28};
+        for (int d : kTry) {
+            uint32_t m = 0;
+            if (safe_read((char*)sp + d, &m, 4) && m == kAnwMagic) { off = d; g_anw_off = d; LOGD("Surface -> ANativeWindow offset = +0x%x", d); break; }
+        }
+    }
+    uint32_t magic = 0;
+    if (off < 0 || !safe_read((char*)sp + off, &magic, 4) || magic != kAnwMagic) {
+        uint8_t dump[48] = {};
+        safe_read(sp, dump, sizeof dump);
+        char hx[48 * 3 + 1]; size_t o = 0;
+        for (size_t i = 0; i < sizeof dump; i++) o += (size_t)snprintf(hx + o, sizeof hx - o, "%02x ", dump[i]);
+        LOGW("BLASTBufferQueue::getSurface returned an object without a window magic (%p): %s", sp, hx);
+        if (++g_bbq_fail >= 3) LOGW("remote sources stay unusable (BLAST window resolve disabled)");
+        return;                                       // ссылку не трогаем: что это за объект — неизвестно
+    }
+    ANativeWindow* nw = (ANativeWindow*)((char*)sp + off);
+    ANativeWindow* old = nullptr;
+    {
+        std::lock_guard<std::mutex> g(g_wem);
+        WinEnt* e = nullptr;
+        WinEnt* oldest = &g_we[0];
+        for (auto& x : g_we) {
+            if (x.self == self) { e = &x; break; }
+            if (x.last < oldest->last) oldest = &x;
+        }
+        if (!e) e = oldest;
+        old = e->win;                                 // пересоздан BBQ или вытеснена старая запись
+        e->self = self; e->bbq = bbq; e->win = nw; e->last = now_ns();
+    }
+    if (old) ANativeWindow_release(old);
+    LOGD("remote source %p: window %p from BLASTBufferQueue %p (%dx%d)", self, (void*)nw, bbq,
+         ANativeWindow_getWidth(nw), ANativeWindow_getHeight(nw));
+}
+
+void hook_bbq_frame(void* bbq, const void* item) {
+    if (g_bbq_key_ok) {
+        BbqCtx* c = (BbqCtx*)pthread_getspecific(g_bbq_key);
+        if (c && c->self) { void* s = c->self; c->self = nullptr; resolve_bbq_window(s, bbq); }   // один раз за queueBuffer
+    }
+    orig_bbq_frame(bbq, item);
+}
+
+// Хук ставится лениво — только когда замечен удалённый источник: играм (кадры идут через Surface-хук) он не нужен.
+void bbq_install_async() {
+    if (g_bbq_tried.exchange(true)) return;
+    std::thread([] {
+        size_t fs = 0, gs = 0;
+        void* f = resolve_symbol_ex("libgui.so", "_ZN7android16BLASTBufferQueue16onFrameAvailableERKNS_10BufferItemE", false, &fs);
+        if (!f) f = resolve_symbol_ex("libgui.so", "_ZN7android16BLASTBufferQueue16onFrameAvailable", true, &fs);
+        void* g = resolve_symbol_ex("libgui.so", "_ZN7android16BLASTBufferQueue10getSurfaceEb", false, &gs);
+        if (!g) g = resolve_symbol_ex("libgui.so", "_ZN7android16BLASTBufferQueue10getSurfaceEb", true, &gs);
+        LOGD("libgui BLASTBufferQueue::onFrameAvailable=%p(%zu) getSurface=%p(%zu)", f, fs, g, gs);
+        if (!f || !g) {
+            LOGW("BLAST window hook unavailable (onFrameAvailable=%p getSurface=%p): video / remote sources will not be captured", f, g);
+            return;
+        }
+        bbq_get_surface = (PFN_bbqGetSurface)g;
+        if (inline_hook("BLASTBufferQueue::onFrameAvailable", f, fs, false, (void*)hook_bbq_frame, (void**)&orig_bbq_frame)) {
+            g_bbq_hooked = true;
+            LOGI("BLAST window hook installed (video / remote sources get their own layer)");
+        } else {
+            LOGW("BLAST window hook not installed: video / remote sources will not be captured");
+        }
+    }).detach();
+}
+
+// Класс очереди определяется один раз при первом кадре (кэш на 8 producer'ов; запись старше 5 с пересчитывается).
+Cls class_of(void* self, bool via_surf, const uint8_t* in) {
+    const int64_t now = now_ns();
+    std::lock_guard<std::mutex> g(g_clsm);
+    Cls* e = nullptr;
+    Cls* oldest = &g_cls[0];
+    for (auto& c : g_cls) {
+        if (c.self == self && now - c.last < 5000000000LL) { e = &c; break; }
+        if (c.last < oldest->last) oldest = &c;
+    }
+    if (e) { e->last = now; return *e; }
+    Cls c;
+    c.self = self; c.last = now;
+    const bool remote = !via_surf && g_surf_ok.load();    // Surface-хук стоит, а кадр пришёл мимо него: Binder-поток
+    c.remote = remote;
+    if (remote) {
+        int32_t is_auto = 1;
+        memcpy(&is_auto, in + 8, sizeof is_auto);       // QueueBufferInput.isAutoTimestamp: у MediaCodec — 0 (явный PTS)
+        if (is_auto == 0) { c.score = kScoreVideo; c.kind = "video"; }
+        else              { c.score = kScoreGame;  c.kind = "remote"; }
+    } else {
+        char nm[20] = {};
+        prctl(PR_GET_NAME, (unsigned long)nm, 0, 0, 0);
+        if (strcmp(nm, "RenderThread") == 0) { c.ui = true; c.kind = "app window"; }
+        else                                  { c.score = kScoreGame; c.kind = "game"; }
+        if (!via_surf) c.kind = "game (no Surface hook)";
+    }
+    *oldest = c;
+    LOGD("queue %p classified: %s (score %d)", self, c.kind, score_of(c));
+    return c;
 }
 
 void record(void* self, int slot, void* buf) {
@@ -187,35 +347,55 @@ void set_elected_window(ANativeWindow* w) {
     if (old) ANativeWindow_release(old);
 }
 
+void clear_elected_window() {
+    ANativeWindow* old;
+    {
+        std::lock_guard<std::mutex> g(g_ewm);
+        old = g_elected_win;
+        g_elected_win = nullptr;
+        g_elected_win_raw.store(nullptr);
+    }
+    if (old) ANativeWindow_release(old);
+}
+
 // Решаем, наш ли это producer. Правила: явный target_w/h из конфига; иначе "побеждает больший".
 // Кандидат обязан давать >= kElectFrames кадров в секунду: редкие кадры HWUI-окна активити
 // и сплеша не должны перебивать игровой producer.
-bool elect(void* self, int w, int h, ANativeWindow* win, int rate_n) {
+bool elect(void* self, int w, int h, ANativeWindow* win, int rate_n, int score, bool remote, const char* kind) {
     int64_t now = now_ns();
     void* cur = g_elected.load();
     if (cur == self) {
-        g_elected_last = now; g_elected_w = w; g_elected_h = h;
+        g_elected_last = now; g_elected_w = w; g_elected_h = h; g_elected_score = score;
         if (self != (void*)&g_ext_token) { g_bq_last = now; g_bq_ever = true; }
         if (win) set_elected_window(win);
         return true;
     }
     if (rate_n < kElectFrames) return false;
-    bool stale = !cur || now - g_elected_last.load() > 500000000LL;
+    const bool explicit_size = g_cfg.target_w > 0 && g_cfg.target_h > 0;
+    if (score <= 0 && !explicit_size) return false;        // окно самого приложения (ui_source=0): не источник
+    const int cur_score = g_elected_score.load();
+    // Видео не отдаём окну приложения: пауза/перемотка дают тишину в очереди видео, но выбирать на её место
+    // что-то другое можно лишь после заметной паузы.
+    const int64_t stale_ns = (cur && cur_score >= kScoreVideo) ? 1500000000LL : 500000000LL;
+    bool stale = !cur || now - g_elected_last.load() > stale_ns;
     const bool ext_cur = cur == (void*)&g_ext_token;       // сейчас кадры идут запасным путём — BufferQueue приоритетнее
     bool take = false;
-    if (g_cfg.target_w > 0 && g_cfg.target_h > 0) {
+    if (explicit_size) {
         take = size_matches(w, h, g_cfg.target_w, g_cfg.target_h);
     } else {
         int64_t ca = (int64_t)w * h, ea = (int64_t)g_elected_w.load() * g_elected_h.load();
-        take = stale || ext_cur || ca * 2 > ea * 3 ||     // сильно больше текущего
-               (blast_hint(w, h) && !blast_hint(g_elected_w.load(), g_elected_h.load()));
+        take = stale || ext_cur || score > cur_score ||
+               (score == cur_score && (ca * 2 > ea * 3 ||                        // сильно больше текущего
+                                       (blast_hint(w, h) && !blast_hint(g_elected_w.load(), g_elected_h.load()))));
     }
     if (!take) return false;
     g_elected = self; g_elected_last = now; g_elected_w = w; g_elected_h = h;
+    g_elected_score = score; g_elected_remote = remote;
     if (self != (void*)&g_ext_token) { g_bq_last = now; g_bq_ever = true; }
     if (win) set_elected_window(win);
-    LOGI("capture: %s %dx%d (%d frames/s)", self == (void*)&g_ext_token ? "fallback source elected" : "game queue elected", w, h, rate_n);
-    LOGD("elected %p window=%p", self, (void*)win);
+    else clear_elected_window();                           // окно прежнего источника к новому не относится
+    LOGI("capture: %s %dx%d (%d frames/s) [%s]", self == (void*)&g_ext_token ? "fallback source elected" : "game queue elected", w, h, rate_n, kind);
+    LOGD("elected %p window=%p remote=%d score=%d", self, (void*)win, (int)remote, score);
     return true;
 }
 
@@ -366,6 +546,10 @@ int hook_queue(void* self, int slot, const void* input, void* output) {
             const uint8_t* in = (const uint8_t*)input;
             if (!format_ok(d.format)) {
                 g_rejected_fmt++;
+            } else if (d.usage & AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT) {
+                // Защищённый (DRM) буфер: небезопасный контекст его не прочитает (чёрный кадр или отказ импорта),
+                // а непрозрачный оверлей закрыл бы им живое видео. Такие кадры не берём вовсе.
+                g_rejected_prot++;
             } else {
                 int32_t crop[4];
                 int cl = 0, ct = 0, cr = (int)d.width, cb = (int)d.height;
@@ -376,7 +560,26 @@ int hook_queue(void* self, int slot, const void* input, void* output) {
                 }
                 const int64_t now = now_ns();
                 const int rate_n = rate_touch(self, now);
-                if (elect(self, cr - cl, cb - ct, via_surf ? ts->win : nullptr, rate_n)) {
+                const Cls kc = class_of(self, via_surf, in);
+                // Удалённый источник (Binder): окно — только из BLAST (resolve_bbq_window), своё чужое окно не подсовываем.
+                ANativeWindow* rw = nullptr;
+                bool can = true;
+                if (kc.remote) {
+                    if (g_cfg.hook_bbq) rw = win_cached_acquire(self);
+                    can = rw != nullptr;
+                    if (!can && !g_remote_warned.load()) {
+                        const int64_t seen = g_remote_seen_ns.load();
+                        if (!seen) g_remote_seen_ns = now;
+                        else if (now - seen > 4000000000LL && !g_remote_warned.exchange(true))
+                            LOGW("%s source %p has no window: %s", kc.kind, self,
+                                 g_cfg.hook_bbq ? "BLASTBufferQueue hook gave none (not a SurfaceView queue?), source ignored"
+                                                : "hook_bbq=0, source ignored");
+                    }
+                }
+                const bool elected = can && elect(self, cr - cl, cb - ct, via_surf ? ts->win : rw, rate_n,
+                                                  score_of(kc), kc.remote, kc.kind);
+                if (rw) ANativeWindow_release(rw);
+                if (elected) {
                     uint32_t tr = 0;
                     memcpy(&tr, in + 36, sizeof tr);
                     int32_t ds = 0;
@@ -406,7 +609,16 @@ int hook_queue(void* self, int slot, const void* input, void* output) {
             }
         }
     }
+    // Удалённый источник (видео/GPU-процесс браузера): пока окна нет, просим BBQ-хук назвать себя изнутри queueBuffer.
+    BbqCtx bctx{self};
+    BbqCtx* bsaved = nullptr;
+    bool barmed = false;
+    if (input && !via_surf && g_cfg.hook_bbq && g_surf_ok.load() && g_bbq_key_ok) {
+        if (g_bbq_hooked.load()) { bsaved = (BbqCtx*)pthread_getspecific(g_bbq_key); pthread_setspecific(g_bbq_key, &bctx); barmed = true; }
+        else bbq_install_async();
+    }
     int r = orig_queue(self, slot, input, output);   // игра не должна заметить вмешательства
+    if (barmed) pthread_setspecific(g_bbq_key, bsaved);
     if (want) {
         if (r == 0) { g_submitted++; submit(job); }
         else job.release();
@@ -424,6 +636,7 @@ bool install() {
     static bool r_ok = false, a_ok = false, q_ok = false, s_tried = false, logged = false, blast_tried = false;
     if (r_ok && q_ok) return true;
     if (!g_tls_ok) g_tls_ok = pthread_key_create(&g_tls_key, nullptr) == 0;
+    if (!g_bbq_key_ok) g_bbq_key_ok = pthread_key_create(&g_bbq_key, nullptr) == 0;
     size_t qs = 0, rs = 0, as = 0;
     void* q = resolve_symbol_ex("libgui.so", "_ZN7android19BufferQueueProducer11queueBufferEi", true, &qs);
     void* r = resolve_symbol_ex("libgui.so", "_ZN7android19BufferQueueProducer13requestBufferEi", true, &rs);
@@ -466,6 +679,7 @@ bool install() {
 }
 
 bool surfaceHooked() { return g_surf_ok.load(); }
+bool electedRemote() { return g_elected_remote.load(); }
 
 ANativeWindow* electedWindow() {
     std::lock_guard<std::mutex> g(g_ewm);
@@ -498,7 +712,7 @@ bool electedSize(int* w, int* h) {
 }
 
 Stats stats() {
-    return {g_queue_calls.load(), g_requested.load(), g_attached.load(), g_queued.load(), g_submitted.load(), g_dropped_job.load(), g_rejected_fmt.load(), g_miss.load(), g_surf_calls.load()};
+    return {g_queue_calls.load(), g_requested.load(), g_attached.load(), g_queued.load(), g_submitted.load(), g_dropped_job.load(), g_rejected_fmt.load(), g_miss.load(), g_surf_calls.load(), g_rejected_prot.load()};
 }
 
 bool bqActive() { return now_ns() - g_bq_last.load() < 1500000000LL; }
@@ -511,7 +725,7 @@ bool extOffer(const void* key, int w, int h, ANativeWindow* win) {
     (void)key;
     const int64_t now = now_ns();
     const int rate_n = rate_touch(const_cast<void*>(key), now);
-    if (!elect((void*)&g_ext_token, w, h, win, rate_n)) return false;
+    if (!elect((void*)&g_ext_token, w, h, win, rate_n, kScoreGame, false, "fallback")) return false;
     return true;
 }
 

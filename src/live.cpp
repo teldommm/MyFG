@@ -47,7 +47,7 @@ void start(const char* package, void (*on_applied)()) {
             D(thermal) D(thermal_hi) D(thermal_lo) D(thermal_hz)
             D(pts_phase) D(qcom_me) D(me_refine) D(me_dy_sign)
             D(pacing)
-            D(target_w) D(target_h) D(elect_blast)
+            D(target_w) D(target_h) D(elect_blast) D(ui_source)
 #undef D
             if (!diff.empty()) LOGI("settings changed:%s", diff.c_str());
             if (on_applied) on_applied();
