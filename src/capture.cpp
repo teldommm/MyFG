@@ -77,7 +77,10 @@ std::atomic<uint64_t> g_blast_calls{0};
 // приоритет: видео (кадры из MediaCodec, явный timestamp) > игра/удалённый рендер > окно приложения.
 constexpr int kScoreUi = 1, kScoreGame = 2, kScoreVideo = 3;
 std::atomic<int>  g_elected_score{0};
-std::atomic<bool> g_elected_remote{false};  // источник приходит через Binder: окно можно получить только из BLAST
+// Откуда приходят кадры выбранного источника: 0 — очередь BufferQueue в этом процессе (игра, окно известно),
+// 1 — через Binder (видео, GPU-процесс браузера: окно только из BLAST), 2 — слой SurfaceControl (sc_capture.cpp).
+constexpr int kModeBq = 0, kModeRemote = 1, kModeSc = 2;
+std::atomic<int> g_elected_mode{kModeBq};
 std::atomic<int64_t> g_remote_seen_ns{0};   // когда впервые увидели такой источник (для предупреждения в логе)
 std::atomic<bool> g_remote_warned{false};
 
@@ -361,7 +364,7 @@ void clear_elected_window() {
 // Решаем, наш ли это producer. Правила: явный target_w/h из конфига; иначе "побеждает больший".
 // Кандидат обязан давать >= kElectFrames кадров в секунду: редкие кадры HWUI-окна активити
 // и сплеша не должны перебивать игровой producer.
-bool elect(void* self, int w, int h, ANativeWindow* win, int rate_n, int score, bool remote, const char* kind) {
+bool elect(void* self, int w, int h, ANativeWindow* win, int rate_n, int score, int mode, const char* kind) {
     int64_t now = now_ns();
     void* cur = g_elected.load();
     if (cur == self) {
@@ -390,12 +393,12 @@ bool elect(void* self, int w, int h, ANativeWindow* win, int rate_n, int score, 
     }
     if (!take) return false;
     g_elected = self; g_elected_last = now; g_elected_w = w; g_elected_h = h;
-    g_elected_score = score; g_elected_remote = remote;
+    g_elected_score = score; g_elected_mode = mode;
     if (self != (void*)&g_ext_token) { g_bq_last = now; g_bq_ever = true; }
     if (win) set_elected_window(win);
     else clear_elected_window();                           // окно прежнего источника к новому не относится
     LOGI("capture: %s %dx%d (%d frames/s) [%s]", self == (void*)&g_ext_token ? "fallback source elected" : "game queue elected", w, h, rate_n, kind);
-    LOGD("elected %p window=%p remote=%d score=%d", self, (void*)win, (int)remote, score);
+    LOGD("elected %p window=%p mode=%d score=%d", self, (void*)win, mode, score);
     return true;
 }
 
@@ -567,7 +570,7 @@ int hook_queue(void* self, int slot, const void* input, void* output) {
                 if (kc.remote) {
                     if (g_cfg.hook_bbq) rw = win_cached_acquire(self);
                     can = rw != nullptr;
-                    if (!can && !g_remote_warned.load()) {
+                    if (!can && !g_remote_warned.load() && !capture::scArmed()) {
                         const int64_t seen = g_remote_seen_ns.load();
                         if (!seen) g_remote_seen_ns = now;
                         else if (now - seen > 4000000000LL && !g_remote_warned.exchange(true))
@@ -577,7 +580,7 @@ int hook_queue(void* self, int slot, const void* input, void* output) {
                     }
                 }
                 const bool elected = can && elect(self, cr - cl, cb - ct, via_surf ? ts->win : rw, rate_n,
-                                                  score_of(kc), kc.remote, kc.kind);
+                                                  score_of(kc), kc.remote ? kModeRemote : kModeBq, kc.kind);
                 if (rw) ANativeWindow_release(rw);
                 if (elected) {
                     uint32_t tr = 0;
@@ -679,7 +682,8 @@ bool install() {
 }
 
 bool surfaceHooked() { return g_surf_ok.load(); }
-bool electedRemote() { return g_elected_remote.load(); }
+bool electedRemote() { return g_elected_mode.load() == kModeRemote; }
+bool electedSc() { return g_elected_mode.load() == kModeSc; }
 
 ANativeWindow* electedWindow() {
     std::lock_guard<std::mutex> g(g_ewm);
@@ -712,7 +716,7 @@ bool electedSize(int* w, int* h) {
 }
 
 Stats stats() {
-    return {g_queue_calls.load(), g_requested.load(), g_attached.load(), g_queued.load(), g_submitted.load(), g_dropped_job.load(), g_rejected_fmt.load(), g_miss.load(), g_surf_calls.load(), g_rejected_prot.load()};
+    return {g_queue_calls.load(), g_requested.load(), g_attached.load(), g_queued.load(), g_submitted.load(), g_dropped_job.load(), g_rejected_fmt.load(), g_miss.load(), g_surf_calls.load(), g_rejected_prot.load(), scBuffers()};
 }
 
 bool bqActive() { return now_ns() - g_bq_last.load() < 1500000000LL; }
@@ -725,7 +729,7 @@ bool extOffer(const void* key, int w, int h, ANativeWindow* win) {
     (void)key;
     const int64_t now = now_ns();
     const int rate_n = rate_touch(const_cast<void*>(key), now);
-    if (!elect((void*)&g_ext_token, w, h, win, rate_n, kScoreGame, false, "fallback")) return false;
+    if (!elect((void*)&g_ext_token, w, h, win, rate_n, kScoreGame, kModeBq, "fallback")) return false;
     return true;
 }
 
@@ -734,4 +738,30 @@ void extSubmit(Job& j) {
     submit(j);
 }
 
+}  // namespace capture
+
+// ---- для sc_capture.cpp ------------------------------------------------------------------
+namespace capture {
+namespace detail {
+int rateTouch(const void* key) { return rate_touch(const_cast<void*>(key), now_ns()); }
+bool formatOk(uint32_t f) { return format_ok(f); }
+void countRejectedFmt() { g_rejected_fmt++; }
+void countRejectedProt() { g_rejected_prot++; }
+void countQueued() { g_queued++; }
+// Слой SurfaceControl предлагает себя в источники. true — выбран именно он.
+bool scElect(const void* key, int w, int h, int rate_n) {
+    if (g_off.load() || !g_cfg.enable) return false;
+    return elect(const_cast<void*>(key), w, h, nullptr, rate_n, kScoreGame, kModeSc, "surface-control layer");
+}
+void scSubmit(Job& j) { g_submitted++; submit(j); }
+const void* electedKey() { return g_elected.load(); }
+// Слой освобождён приложением: если он был источником, выбор сбрасывается (следующий кандидат берёт его без ожидания).
+bool dropElected(const void* key) {
+    void* exp = const_cast<void*>(key);
+    if (!g_elected.compare_exchange_strong(exp, nullptr)) return false;
+    g_elected_last = 0;
+    g_elected_mode = kModeBq;
+    return true;
+}
+}  // namespace detail
 }  // namespace capture

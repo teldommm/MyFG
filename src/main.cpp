@@ -76,6 +76,16 @@ bool pkg_is_sane(const std::string& s) {
     return true;
 }
 
+// Вспомогательный процесс приложения: «пакет:суффикс». Нужны только GPU-процессы браузеров на Chromium
+// (`privileged_process0`, ...): страницу и видео Chrome рисует там, а не в процессе браузера. Остальное
+// (push, сервисы, изолированные sandboxed_process и т.п.) модуль не трогает.
+bool aux_proc_ok(const std::string& proc) {
+    if (proc.size() > 40 || proc.compare(0, 18, "privileged_process") != 0) return false;
+    for (char c : proc)
+        if (!(isalnum((unsigned char)c) || c == '_')) return false;
+    return true;
+}
+
 bool in_packages_list(const std::string& pkg) {
     std::string s = read_cfg("packages.list");
     size_t pos = 0;
@@ -126,7 +136,14 @@ public:
         if (!nn) return;
         pkg_ = nn;
         env_->ReleaseStringUTFChars(args->nice_name, nn);
-        if (!pkg_is_sane(pkg_)) return;       // системные/доп. процессы и мусор отсекаем сразу
+        const size_t colon = pkg_.find(':');
+        if (colon != std::string::npos) {
+            const std::string proc = pkg_.substr(colon + 1);
+            pkg_.resize(colon);
+            if (!aux_proc_ok(proc)) return;   // чужие вспомогательные процессы не трогаем
+            aux_ = true;
+        }
+        if (!pkg_is_sane(pkg_)) return;       // системные процессы и мусор отсекаем сразу
 
         int fd = api_->connectCompanion();
         if (fd < 0) return;
@@ -149,7 +166,7 @@ public:
         }
         JavaVM* vm = nullptr;
         if (env_ && env_->GetJavaVM(&vm) == 0) display::init(vm);   // HDR-возможности панели для SDR->HDR
-        myfg::start(cfg_.c_str(), pkg_.c_str());
+        myfg::start(cfg_.c_str(), pkg_.c_str(), aux_);
     }
 
 private:
@@ -157,6 +174,7 @@ private:
     JNIEnv* env_ = nullptr;
     std::string pkg_, cfg_;
     bool target_ = false;
+    bool aux_ = false;          // GPU-процесс браузера (`пакет:privileged_process*`)
 };
 
 }  // namespace
@@ -165,6 +183,7 @@ namespace myfg {
 namespace {
 std::string g_pkg;
 std::atomic<bool> g_begun{false};
+bool g_aux = false;
 
 // Запускает всё, что нужно для работы (установка хуков и конвейер). Один раз за процесс.
 void begin() {
@@ -174,8 +193,8 @@ void begin() {
         if (g_cfg.multiplier >= 2) snprintf(mode, sizeof mode, "x%d", g_cfg.multiplier);
         else if (g_cfg.target_fps > 0) snprintf(mode, sizeof mode, "target %d fps", g_cfg.target_fps);
         else snprintf(mode, sizeof mode, "display rate");
-        LOGI("%s: mode=%s max_gen=%d flow=%dpx min_fps=%d adaptive=%d(%d%%) hdr=%d panel=%dHz dup=%d live=%d",
-             g_pkg.c_str(), mode, g_cfg.max_gen, g_cfg.flow_side, g_cfg.min_fps, g_cfg.adaptive, g_cfg.gpu_budget,
+        LOGI("%s%s: mode=%s max_gen=%d flow=%dpx min_fps=%d adaptive=%d(%d%%) hdr=%d panel=%dHz dup=%d live=%d",
+             g_pkg.c_str(), g_aux ? " (GPU process)" : "", mode, g_cfg.max_gen, g_cfg.flow_side, g_cfg.min_fps, g_cfg.adaptive, g_cfg.gpu_budget,
              g_cfg.hdr, g_cfg.panel_hz, g_cfg.dup_detect, g_cfg.live);
         LOGD("hooks: surface=%d egl=%d anw=%d vk=%d swap=%d present=%d fallback_ms=%d blast=%d delay=%dms | vote=%d anchor=%d onComplete=%d prio=%d layer_tf=%d",
              g_cfg.hook_surface, g_cfg.hook_egl, g_cfg.hook_anw, g_cfg.hook_vk, g_cfg.hook_swap, g_cfg.hook_present, g_cfg.fallback_ms,
@@ -199,8 +218,11 @@ void on_live_update() {
 
 // Запускается в процессе игры. Хуки ставим из отдельного потока с повторами: в момент
 // specialize нужные библиотеки (особенно libvulkan) могут быть ещё не загружены.
-void start(const char* config_blob, const char* package) {
+bool auxProcess() { return g_aux; }
+
+void start(const char* config_blob, const char* package, bool aux) {
     g_cfg.parse(config_blob);
+    g_aux = aux;
     g_pkg = package ? package : "";
     // live стартует всегда: иначе включение модуля в WebUI не действовало бы на игру, запущенную при enable=0.
     live::start(package, &on_live_update);

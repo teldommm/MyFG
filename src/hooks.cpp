@@ -89,7 +89,7 @@ void* hook_gdpa(void* dev, const char* name) {
 }
 
 bool g_egl = false, g_vk = false, g_vk_gave_up = false, g_anw = false, g_bq = false;
-bool g_swap_inst = false, g_present_inst = false, g_monitor = false;
+bool g_swap_inst = false, g_present_inst = false, g_monitor = false, g_sc = false;
 int g_attempts = 0;
 
 // Монитор запасных путей: решает, когда они «взведены». Запасной путь работает только пока BufferQueue
@@ -98,6 +98,13 @@ void monitor_loop() {
     for (;;) {
         usleep(500 * 1000);
         if (!g_cfg.enable) continue;
+        // GPU-процесс браузера: кадры идут слоями SurfaceControl (sc_capture.cpp) или через окно (хук Surface).
+        // eglSwapBuffers/vkQueuePresentKHR запасного пути перехватили бы внутренние поверхности самого Chromium.
+        if (myfg::auxProcess() || capture::scArmed()) {
+            fallback::setEglActive(false);
+            fallback::setVkActive(false);
+            continue;
+        }
         const bool bq_failed = !g_bq && g_attempts >= 5;
         const int64_t since = (now_ns() - capture::startNs()) / 1000000;
         const bool silent = !capture::bqActive() && (bq_failed || since >= g_cfg.fallback_ms);
@@ -167,7 +174,9 @@ bool tryInstall() {
     static bool started = false;
     // Конвейер нужен и в режиме «только запасные пути»: BufferQueue-хуки не встали, а EGL/Vulkan-запас включён.
     const bool fb_only = !g_bq && g_attempts >= 5 && (g_cfg.hook_swap != 0 || g_cfg.hook_present != 0);
-    if ((g_bq || fb_only) && !started) { started = true; pipeline::start(); }
+    // Захват слоёв SurfaceControl (GPU-процесс браузера): true — повторять не нужно.
+    if (!g_sc) g_sc = capture::installSc();
+    if ((g_bq || fb_only || capture::scArmed()) && !started) { started = true; pipeline::start(); }
     if (!g_monitor) { g_monitor = true; std::thread(monitor_loop).detach(); }
     const bool surf = capture::surfaceHooked();     // решение окончательное, как только g_bq == true
     // BufferQueue-путь «определился»: либо встал, либо за несколько попыток так и не встал.
@@ -202,7 +211,7 @@ bool tryInstall() {
     }
     const bool need_vk = g_cfg.hook_vk && !g_vk && !g_vk_gave_up;
     const bool need_present = want_present && !g_present_inst && !fallback::vkFailed();
-    return g_bq && !need_vk && !need_present;      // EGL/ANW — "лучшее из возможного", не блокируют завершение
+    return g_bq && g_sc && !need_vk && !need_present;      // EGL/ANW — "лучшее из возможного", не блокируют завершение
 }
 
 }  // namespace hooks

@@ -205,8 +205,10 @@ void main() {
 #endif
     // The real pair where it sits: the splat guard, the early-out below and the static test at
     // the end all need it.
-    vec3 s0 = textureLod(prevColor, uv, 0.0).xyz;
-    vec3 s1 = textureLod(nextColor, uv, 0.0).xyz;
+    vec4 s0a = textureLod(prevColor, uv, 0.0);
+    vec4 s1a = textureLod(nextColor, uv, 0.0);
+    vec3 s0 = s0a.xyz;
+    vec3 s1 = s1a.xyz;
     float rStatic = dot(abs(s0 - s1), vec3(1.0));
 
 #if DIS_SPLAT
@@ -243,7 +245,7 @@ void main() {
     // brings the object in. Static scenery and HUD-heavy screens are mostly this case.
     vec2 fpx = max(abs(f), abs(fa)) * vec2(size);
     if (max(fpx.x, fpx.y) <= 0.25 && rStatic < 0.03) {
-        imageStore(outImage, pix, vec4(mix(s0, s1, pc.t), 1.0));
+        imageStore(outImage, pix, vec4(mix(s0, s1, pc.t), mix(s0a.a, s1a.a, pc.t)));
         return;
     }
 
@@ -256,7 +258,10 @@ void main() {
 
     vec3 c0 = warpSample(prevColor, uv0, vec2(size));
     vec3 c1 = warpSample(nextColor, uv1, vec2(size));
-
+    // Alpha follows the same warp with one bilinear tap: a translucent source (a page layer
+    // with transparency) keeps its coverage instead of coming out opaque.
+    float a0 = textureLod(prevColor, clamp(uv0, vec2(0.0), vec2(1.0)), 0.0).a;
+    float a1 = textureLod(nextColor, clamp(uv1, vec2(0.0), vec2(1.0)), 0.0).a;
 
     // How far each sample is from being inside its frame. The feather lies inside the frame: a
     // sample past the edge has nothing (the fetch is clamped to the edge column), so it gets no
@@ -281,6 +286,10 @@ void main() {
     // evidence of an occlusion: comparing against it would call the frame edge one and hand the
     // pixel to exactly the sample that is off-frame. There the in-frame sample above already
     // stands alone.
+    float resA = wsum > 1e-4
+        ? (a0 * w0 + a1 * w1) / wsum
+        : (out0 <= out1 ? a0 : a1);
+
     float bothIn = (1.0 - out0) * (1.0 - out1);
     float rMotion = dot(abs(c0 - c1), vec3(1.0));
     float occl = smoothstep(OCCL_LO, OCCL_HI, rMotion * bothIn);
@@ -306,6 +315,7 @@ void main() {
         single = mix(single, c0, smoothstep(0.3, 0.7, (1.0 - hp) * h1 * (1.0 - h0)));
 #endif
         result = mix(result, single, occl);
+        resA = mix(resA, pc.t < 0.5 ? a0 : a1, occl);
     }
 
 #if DIS_STATIC_SELECT
@@ -328,8 +338,9 @@ void main() {
         keep = max(keep, histStatic * stillWins * bothIn);
 #endif
         result = mix(result, mix(s0, s1, pc.t), keep);
+        resA = mix(resA, mix(s0a.a, s1a.a, pc.t), keep);
     }
 #endif
 
-    imageStore(outImage, pix, vec4(result, 1.0));
+    imageStore(outImage, pix, vec4(result, clamp(resA, 0.0, 1.0)));
 }

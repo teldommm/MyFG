@@ -24,5 +24,7 @@ static inline int64_t now_ns() {
 
 // Точка входа "в процессе игры": вызывается из postAppSpecialize (main.cpp).
 namespace myfg {
-void start(const char* config_blob, const char* package);
+void start(const char* config_blob, const char* package, bool aux);
+// true — модуль загружен во вспомогательный GPU-процесс браузера (`пакет:privileged_process*`).
+bool auxProcess();
 }

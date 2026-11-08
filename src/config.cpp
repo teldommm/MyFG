@@ -26,7 +26,7 @@ void Config::parse(const char* blob) {
         KEY(auto_rate) KEY(dataspace) KEY(hide_ms)
         KEY(hook_swap) KEY(hook_present) KEY(fallback_ms) KEY(panel_hz) KEY(panel_game_vote) KEY(panel_anchor)
         KEY(multiplier) KEY(dup_detect) KEY(dup_thresh) KEY(use_oncomplete) KEY(queue_prio) KEY(elect_blast)
-        KEY(layer_tf) KEY(hook_bbq) KEY(ui_source) KEY(live) KEY(debug) KEY(hud) KEY(hud_mode) KEY(hud_pos) KEY(hud_scale) KEY(hud_tf) KEY(hdr) KEY(hdr_pw) KEY(hdr_peak) KEY(hdr_knee) KEY(hdr_boost) KEY(hdr_gamma) KEY(hdr_ct) KEY(hdr_sat) KEY(adaptive) KEY(gpu_budget)
+        KEY(layer_tf) KEY(hook_bbq) KEY(ui_source) KEY(hook_sc) KEY(live) KEY(debug) KEY(hud) KEY(hud_mode) KEY(hud_pos) KEY(hud_scale) KEY(hud_tf) KEY(hdr) KEY(hdr_pw) KEY(hdr_peak) KEY(hdr_knee) KEY(hdr_boost) KEY(hdr_gamma) KEY(hdr_ct) KEY(hdr_sat) KEY(adaptive) KEY(gpu_budget)
         KEY(thermal) KEY(thermal_hi) KEY(thermal_lo) KEY(thermal_hz)
         KEY(pts_phase) KEY(qcom_me) KEY(me_refine) KEY(me_dy_sign)
         KEY(pacing)
@@ -72,6 +72,7 @@ void Config::sanitize() {
     clampi(queue_prio, 0, 1);
     clampi(elect_blast, 0, 1);
     clampi(hook_bbq, 0, 1);
+    clampi(hook_sc, -1, 1);
     clampi(ui_source, 0, 1);
     clampi(layer_tf, -1, 7);
     clampi(live, 0, 1);

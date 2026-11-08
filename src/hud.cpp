@@ -1,6 +1,7 @@
 #include "hud.h"
 #include "common.h"
 #include "config.h"
+#include "capture.h"
 
 #include <android/hardware_buffer.h>
 #include <pthread.h>
@@ -213,7 +214,7 @@ void loop() {
             ASurfaceTransaction_setBuffer(t, a, b, -1);
             ASurfaceTransaction_setVisibility(t, a, ASURFACE_TRANSACTION_VISIBILITY_SHOW);
             ASurfaceTransaction_setBufferTransparency(t, a, ASURFACE_TRANSACTION_TRANSPARENCY_TRANSLUCENT);
-            ASurfaceTransaction_setZOrder(t, a, g_cfg.zorder + 1);   // выше слоя оверлея
+            ASurfaceTransaction_setZOrder(t, a, capture::electedSc() ? 0x3fffffff : g_cfg.zorder + 1);   // выше слоя оверлея (в SC-режиме — выше всех слоёв приложения)
             ASurfaceTransaction_setGeometry(t, a, srcR, dst, tf);
             ASurfaceTransaction_apply(t);
             ASurfaceTransaction_delete(t);

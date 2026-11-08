@@ -288,6 +288,11 @@ private:
         }
         std::lock_guard<std::mutex> g(sc_m_);
         if (!sc_) { it.drop(); return; }
+        // Слой-источник SurfaceControl: оверлей повторяет его видимость, геометрию, z, прозрачность и альфу.
+        // Источник скрыт или исчез — кадр не показываем (оверлей прячет housekeeping по сигналу из sc_capture).
+        const bool scm = scKey_.load() != 0;
+        capture::ScLive lv;
+        if (scm && (!capture::scLive(&lv) || !lv.visible)) { it.drop(); return; }
         ASurfaceTransaction* t = ASurfaceTransaction_create();
         ASurfaceTransaction_setBuffer(t, sc_, it.ahb, it.fence_fd);      // fd забирает транзакция
         it.fence_fd = -1;
@@ -303,18 +308,24 @@ private:
                 applied_ds_ = ds;
             }
         }
-        ASurfaceTransaction_setZOrder(t, sc_, g_cfg.zorder);
-        ASurfaceTransaction_setBufferTransparency(t, sc_, ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
-        // transform слоя: из QueueBufferInput или принудительный (layer_tf 0..7)
-        const uint32_t tf = g_cfg.layer_tf >= 0 ? (uint32_t)g_cfg.layer_tf : it.transform;
+        ASurfaceTransaction_setZOrder(t, sc_, scm ? lv.z : g_cfg.zorder);
+        // Оверлей игры непрозрачен. Оверлей слоя приложения прозрачен так же, как источник: у источника с
+        // альфа-каналом (дыра под видео) непрозрачный оверлей закрыл бы то, что лежит под ним.
+        ASurfaceTransaction_setBufferTransparency(t, sc_, scm && lv.transparency != ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE
+                                                              ? ASURFACE_TRANSACTION_TRANSPARENCY_TRANSLUCENT
+                                                              : ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
+        if (scm) ASurfaceTransaction_setBufferAlpha(t, sc_, lv.alpha);
+        // transform слоя: из QueueBufferInput / слоя-источника или принудительный (layer_tf 0..7)
+        const uint32_t tf = g_cfg.layer_tf >= 0 ? (uint32_t)g_cfg.layer_tf : (scm ? (uint32_t)lv.transform : it.transform);
         // Размер окна спрашиваем у окна ЗДЕСЬ (под sc_m_): кэш win_w_/win_h_ обновляется
         // только разметкой раз в секунду (housekeeping), и после поворота/ресайза оверлей
         // до секунды растягивался бы по старой геометрии.
         int ww = 0, wh = 0;
-        if (win_) { ww = ANativeWindow_getWidth(win_); wh = ANativeWindow_getHeight(win_); }
-        if (ww <= 0 || wh <= 0) { ww = it.w; wh = it.h; if (tf & 4) { int x = ww; ww = wh; wh = x; } }
+        if (!scm && win_) { ww = ANativeWindow_getWidth(win_); wh = ANativeWindow_getHeight(win_); }
+        if (ww <= 0 || wh <= 0) { ww = it.w; wh = it.h; if (!scm && (tf & 4)) { int x = ww; ww = wh; wh = x; } }
         ARect src = {0, 0, it.w, it.h};
         ARect dst = {0, 0, ww, wh};
+        if (scm && lv.geom) dst = {lv.dl, lv.dt, lv.dr, lv.db};      // там, где приложение показывает кадры источника
         ASurfaceTransaction_setGeometry(t, sc_, src, dst, (int32_t)tf);
         if (vsync_id && setFrameTimeline_) setFrameTimeline_(t, *vsync_id);
         // Частота слоя (голос SurfaceFlinger): display_fps > auto_rate > panel_hz. Повторяем раз в 0.5 с,
@@ -417,12 +428,13 @@ private:
     bool ensureSurfaceControl() {
         int ew, eh;
         if (!capture::electedSize(&ew, &eh)) return false;
+        if (capture::electedSc()) return ensureScOverlay();
         ANativeWindow* w = capture::electedWindow();          // точное окно игры (хук Surface) или SurfaceView (BLAST)
         // Эвристика «последнее окно приложения» годится только для игр. У удалённого источника (видео, GPU-процесс
         // браузера) окно известно строго из BLAST: подсунуть своё значит закрыть оверлеем весь интерфейс приложения.
         if (!w && !capture::electedRemote()) w = hooks::pickWindow(ew, eh);
         if (!w) return false;
-        if (w == win_) { ANativeWindow_release(w); refreshWinSize(); return true; }
+        if (w == win_ && scKey_.load() == 0) { ANativeWindow_release(w); refreshWinSize(); return true; }
         ASurfaceControl* sc = ASurfaceControl_createFromWindow(w, "myfg_overlay");
         if (!sc) {
             if (sc_fail_cnt_ < 3 || g_cfg.debug)      // housekeeping зовёт раз в секунду: не заливаем лог
@@ -432,11 +444,20 @@ private:
             return false;
         }
         sc_fail_cnt_ = 0;
+        swapOverlay(sc, w, 0);
+        LOGI("overlay layer created on window %p (%dx%d)", w, (int)win_w_, (int)win_h_);
+        return true;
+    }
+
+    // Подставляет новый слой-оверлей вместо прежнего. w — окно с взятой ссылкой (переходит нам), может быть nullptr
+    // (SC-режим без известного окна корня); key — идентификатор родителя в SC-режиме, 0 — оверлей на окне игры.
+    void swapOverlay(ASurfaceControl* sc, ANativeWindow* w, uint64_t key) {
         ASurfaceControl* old; ANativeWindow* oldw;
         {
             std::lock_guard<std::mutex> g(sc_m_);
             old = sc_; oldw = win_;
             sc_ = sc; win_ = w;
+            scKey_.store(key);
             applied_rate_ = 0.0f; applied_ds_ = -1; visible_.store(false);
             sc_gen_.fetch_add(1);              // callbacks старого слоя больше не трогают его
             shown_slot_ = nullptr;
@@ -452,7 +473,23 @@ private:
         }
         if (oldw) ANativeWindow_release(oldw);
         refreshWinSize();
-        LOGI("overlay layer created on window %p (%dx%d)", w, (int)win_w_, (int)win_h_);
+    }
+
+    // Источник — слой SurfaceControl (GPU-процесс браузера): оверлей — сосед источника у того же родителя.
+    bool ensureScOverlay() {
+        const uint64_t pk = capture::scParentKey();
+        if (!pk) return false;                          // родитель источника неизвестен: слой не создаём
+        if (sc_ && scKey_.load() == pk) return true;
+        uint64_t key = 0;
+        ANativeWindow* root = nullptr;
+        ASurfaceControl* sc = capture::scCreateOverlay("myfg_overlay", &key, &root);
+        if (!sc) {
+            if (sc_fail_cnt_ < 3 || g_cfg.debug) LOGW("overlay layer next to the source layer could not be created");
+            sc_fail_cnt_++;
+            return false;
+        }
+        sc_fail_cnt_ = 0;
+        swapOverlay(sc, root, key);
         return true;
     }
     void refreshWinSize() {
@@ -1131,8 +1168,27 @@ private:
             voteGameRate();
         }
     }
+    // Быстрая проверка слоя-источника (на каждую итерацию, не раз в секунду): скрытие и пересоздание оверлея.
+    void scWatch() {
+        if (capture::scTakeInvalidated()) {
+            // источник скрыт/перемещён/освобождён: показанный оверлей и всё, что ждёт показа, неактуальны
+            clearQueue();
+            hide_req_.store(true);
+            hideNow();
+        }
+        const bool sc_now = capture::electedSc();
+        const uint64_t pk = sc_now ? capture::scParentKey() : 0;
+        const bool relayer = sc_now ? (pk && pk != scKey_.load())       // родитель сменился (или режим): слой пересоздаём
+                                    : scKey_.load() != 0;               // источник стал обычной очередью: оверлей на окне игры
+        if (relayer) {
+            const int64_t n = now_ns();
+            if (n - sc_try_ns_ > 200000000LL) { sc_try_ns_ = n; ensureSurfaceControl(); }   // не чаще 5 раз в секунду
+        }
+    }
+
     void housekeeping() {
         const int64_t n = now_ns();
+        scWatch();
         if (n - last_check_ < 1000000000LL) return;
         last_check_ = n;
         // B: пейсинг выключили на ходу — надбавка выбора таймлайна больше не действует
@@ -1230,10 +1286,10 @@ private:
                 auto cs = capture::stats();
                 int ew = 0, eh = 0;
                 bool el = capture::electedSize(&ew, &eh);
-                LOGW("no usable game frames yet (%d s): surfCalls=%llu queueCalls=%llu request=%llu attach=%llu queued=%llu slotMiss=%llu fmtRej=%llu elected=%d(%dx%d) surfaceHook=%d",
+                LOGW("no usable game frames yet (%d s): surfCalls=%llu queueCalls=%llu request=%llu attach=%llu queued=%llu slotMiss=%llu fmtRej=%llu elected=%d(%dx%d) surfaceHook=%d sc=%llu",
                      (tick + 1) / 10, (unsigned long long)cs.surf_calls, (unsigned long long)cs.queue_calls, (unsigned long long)cs.requested,
                      (unsigned long long)cs.attached, (unsigned long long)cs.queued, (unsigned long long)cs.slot_miss,
-                     (unsigned long long)cs.rejected_fmt, el, ew, eh, (int)capture::surfaceHooked());
+                     (unsigned long long)cs.rejected_fmt, el, ew, eh, (int)capture::surfaceHooked(), (unsigned long long)cs.sc_buffers);
             }
         }
 
@@ -1267,6 +1323,7 @@ private:
     bool windowReady() {
         int w, h;
         if (!capture::electedSize(&w, &h)) return false;
+        if (capture::electedSc()) return capture::scParentKey() != 0;     // оверлей станет соседом источника
         ANativeWindow* win = capture::electedWindow();
         if (!win && !capture::electedRemote()) win = hooks::pickWindow(w, h);
         if (!win) return false;
@@ -1833,6 +1890,8 @@ private:
     PFN_setFrameRate setFrameRate_ = nullptr;
     PFN_winRate winRate_ = nullptr;
 
+    int64_t sc_try_ns_ = 0;                // последняя попытка пересоздать оверлей (scWatch)
+    std::atomic<uint64_t> scKey_{0};        // родитель оверлея в SC-режиме (слой-сосед источника); 0 — оверлей на окне игры
     std::atomic<uint64_t> sc_gen_{0};      // поколение слоя: устаревшие onComplete не трогают его
     ASurfaceControl* sc_grave_ = nullptr;       // прежний слой: освобождается при следующей замене
     Slot* shown_slot_ = nullptr;                // под sc_m_: слот, показанный последней транзакцией

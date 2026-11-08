@@ -89,6 +89,7 @@ const SCHEMA = [
     { k: 'elect_blast', t: 'bool', def: 1, icon: '🧭' },
     { k: 'hook_bbq', t: 'bool', def: 1, icon: '🎞️' },
     { k: 'ui_source', t: 'bool', def: 0, icon: '🪟' },
+    { k: 'hook_sc', t: 'pick', def: -1, min: -1, max: 1, vals: [-1, 0, 1], opts: ['sc_auto', 'sc_off', 'sc_any'], icon: '🌐' },
     { k: 'hook_swap',    t: 'mode', def: 1, icon: '🧩' },
     { k: 'hook_present', t: 'mode', def: 1, icon: '🧩' },
     { k: 'fallback_ms',  t: 'num',  def: 10000, min: 1000, max: 120000, step: 1000, unit: 'ms', icon: '⏲️', dep: [['hook_swap', '=', 1], ['hook_present', '=', 1]] },
@@ -189,6 +190,8 @@ ru: {
   k_elect_blast: 'Подсказки BLASTBufferQueue', d_elect_blast: 'Размеры окон из BLASTBufferQueue помогают выбрать игровую очередь (хук при запуске)',
   k_hook_bbq: 'Окно видео через BLAST', d_hook_bbq: 'Видео и кадры из GPU-процесса (Binder): слой оверлея встаёт ровно на SurfaceView и остаётся под интерфейсом. Выкл. — такие источники не обрабатываются',
   k_ui_source: 'Окно приложения как источник', d_ui_source: 'Разрешить брать кадры интерфейса приложения (HWUI). Обычно не нужно: закрывает видео чёрным прямоугольником',
+  k_hook_sc: 'Слои SurfaceControl (браузер)', d_hook_sc: 'Захват страницы и видео Chrome: слои, которые GPU-процесс браузера (privileged_process) отдаёт в SurfaceControl. «Авто» — только в таком процессе, «Любой» — в любом приложении. Хук — при запуске; добавьте пакет браузера в список и перезапустите его',
+  sc_auto: 'Авто', sc_off: 'Выкл.', sc_any: 'Везде',
   k_hook_swap: 'Запасной захват: eglSwapBuffers', d_hook_swap: 'GLES-игры, если BufferQueue не отдаёт кадры. «Запасной» — включается через время ниже; «Всегда» — хук ставится сразу. Хук — при запуске',
   k_hook_present: 'Запасной захват: vkQueuePresentKHR', d_hook_present: 'Vulkan-игры. Хук vkCreateDevice должен стоять до создания устройства: «Запасной» — только если BufferQueue-хуки не встали, «Всегда» — всегда. Применяется при запуске',
   k_fallback_ms: 'Включать запасной захват через', d_fallback_ms: 'Сколько мс без кадров от BufferQueue после старта; запасной путь молчит, пока BufferQueue работает',
@@ -314,6 +317,8 @@ en: {
   k_elect_blast: 'BLASTBufferQueue hints', d_elect_blast: 'Window sizes from BLASTBufferQueue help pick the game queue (hook at launch)',
   k_hook_bbq: 'Video window via BLAST', d_hook_bbq: 'Video and frames from a GPU process (Binder): the overlay layer attaches exactly to the SurfaceView and stays under the app UI. Off - such sources are ignored',
   k_ui_source: 'App window as source', d_ui_source: 'Allow capturing the app UI window (HWUI). Usually not wanted: it covers video with a black rectangle',
+  k_hook_sc: 'SurfaceControl layers (browser)', d_hook_sc: 'Captures Chrome pages and video: the layers the browser GPU process (privileged_process) hands to SurfaceControl. “Auto” - only in such a process, “Any” - in every app. Hook at launch; add the browser package to the list and restart it',
+  sc_auto: 'Auto', sc_off: 'Off', sc_any: 'Everywhere',
   k_hook_swap: 'Fallback capture: eglSwapBuffers', d_hook_swap: 'GLES games when BufferQueue yields no frames. “Fallback” arms after the delay below; “Always” installs the hook at once. Hook at launch',
   k_hook_present: 'Fallback capture: vkQueuePresentKHR', d_hook_present: 'Vulkan games. The vkCreateDevice hook must be in place before the device exists: “Fallback” = only if the BufferQueue hooks failed, “Always” = always. Applied at launch',
   k_fallback_ms: 'Arm fallback capture after', d_fallback_ms: 'Milliseconds without BufferQueue frames after launch; the fallback stays silent while BufferQueue works',
@@ -686,7 +691,7 @@ const iconBox = ic => h('span', { class: 'tu-row-icon', text: ic });
 // не входят (Config::applyLive в config.cpp). Под такими настройками показывается пометка.
 // target_w/target_h/elect_blast/ui_source читаются на каждом кадре и применяются на ходу (см. applyLive).
 const RESTART_KEYS = new Set(['hook_surface', 'hook_egl', 'hook_anw', 'hook_vk', 'hook_swap', 'hook_present', 'hook_delay_ms',
-  'fallback_ms', 'queue_prio', 'hook_bbq']);
+  'fallback_ms', 'queue_prio', 'hook_bbq', 'hook_sc']);
 const textBox = (label, desc) => {
   const dk = label && label.dataset ? label.dataset.i18n : '';
   const key = dk && dk.startsWith('k_') ? dk.slice(2) : '';

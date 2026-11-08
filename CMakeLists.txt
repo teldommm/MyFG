@@ -65,6 +65,7 @@ add_library(myfg SHARED
   src/util.cpp
   src/hooks.cpp
   src/capture.cpp
+  src/sc_capture.cpp
   src/fallback_egl.cpp
   src/fallback_vk.cpp
   src/live.cpp
