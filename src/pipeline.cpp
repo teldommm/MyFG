@@ -24,7 +24,6 @@
 #include "hud.h"
 #include "vk_ctx.h"
 #include "hdr.h"
-#include "qcom_ex.h"
 #include "display.h"
 #include "vsync.h"
 #include "vkr_dis.h"
@@ -399,18 +398,6 @@ private:
 
     void push(OutItem& it) {
         std::lock_guard<std::mutex> g(oq_m_);
-        // Экстраполяция: пришёл новый реальный кадр — предсказания по прошлой паре, чья цель позже цели этого кадра,
-        // уже не нужны (иначе они показались бы ПОСЛЕ реального и картинка откатилась бы на полшага назад).
-        if (it.real && exMode_.load()) {
-            for (int i = 0; i < on_;) {
-                if (!oq_[i].real && oq_[i].target_ns > it.target_ns) {
-                    oq_[i].drop();
-                    for (int k = i + 1; k < on_; k++) oq_[k - 1] = oq_[k];
-                    on_--;
-                    dropped_ex_++;
-                } else i++;
-            }
-        }
         if (on_ == kQ) {
             // Переполнение: реальные кадры не теряем. Жертва — старейший сгенерированный кадр
             // (как в догоне onVsync); если очередь целиком из реальных — выбрасываем входящий
@@ -600,7 +587,6 @@ private:
     bool buildRings(uint32_t w, uint32_t h) {
         clearQueue();
         vk_.f.DeviceWaitIdle(vk_.dev);
-        qcomEx::dropTargets();                       // GL-обёртки слотов прежних колец (режим qcom_ex)
         ringGen_++;                                  // колбэки прежнего кольца отбрасываются по rgen
         {
             std::lock_guard<std::mutex> g(sc_m_);
@@ -1338,19 +1324,6 @@ private:
         return true;
     }
 
-    // λ в ТОЧКЕ ВЫВОДА (после submit/подачи команд): метка источника -> готовность блока к показу (см. P0-fix ниже).
-    void lambdaUpdate(const capture::Job& j) {
-        if (j.pts_ns > 0) {
-            const int64_t lam = now_ns() - j.pts_ns;             // метка источника → готовность блока к показу
-            if (!lamValid_) { lamEma_ = (double)lam; lamValid_ = true; }
-            else if (llabs(lam - (int64_t)lamEma_) > 60000000LL) {   // скачок: seek/смена источника
-                if (lamResets_ < 8) LOGD("pts-phase: clock jump %+lld ms, resetting", (long long)(lam - (int64_t)lamEma_) / 1000000);
-                lamEma_ = (double)lam; lamResets_++;
-            } else lamEma_ += (double)(lam - lamEma_) * 0.20;    // τ ≈ 5 кадров на 30 fps
-            lamSamples_++;
-        }
-    }
-
     void process(capture::Job& j) {
         const uint32_t w = (uint32_t)(j.cr - j.cl), h = (uint32_t)(j.cb - j.ct);
         if (w < 16 || h < 16) return;
@@ -1363,43 +1336,12 @@ private:
         waitFrame(fr);
         if ((++purge_tick_ & 63u) == 0) purgeStale();
 
-        // ---- режим экстраполяции Adreno (qcom_ex): весь путь на GL-острове, Vulkan-импорт и WFG не нужны ----
-        bool ex = g_cfg.qcom_ex != 0 && !exFail_;
-        if (ex && !qcomEx::ensure()) { exFail_ = true; ex = false; }
-        if (ex && !qcomEx::available()) { exFail_ = true; ex = false; }      // режим «умер» на ходу (ошибки GL)
-        if (ex != exWas_) {
-            exWas_ = ex;
-            exMode_.store(ex);
-            prevValid_ = false;
-            if (ex) { qcomEx::reset(); LOGI("frame generation: Adreno extrapolation (qcom_ex)"); }
-            else {
-                if (wfg_) vkr_dis_reset(wfg_);                 // история WFG прервана — пары через разрыв не нужны
-                LOGI("frame generation: WFG interpolation");
-            }
-            plan_last_ = -1; plan_stable_ = 0; exN_ = 0; exCand_ = 0; exCandCnt_ = 0;
-        }
         AhbImage tmp;
         AhbImage* src = nullptr;
-        if (ex) {
-            const qcomEx::Begin eb = qcomEx::begin(j.src, j.fence_fd, j.cl, j.ct, j.cr, j.cb, (int)j.bw, (int)j.bh,
-                                                   g_cfg.dup_detect != 0, g_cfg.dup_thresh);
-            if (eb == qcomEx::Begin::Dup) { dup_skipped_++; return; }   // повтор: интервал считается между уникальными кадрами
-            if (eb == qcomEx::Begin::Fail) {
-                import_fail_++;
-                if (import_fail_ % 120 == 1) LOGW("qcom-ex: game frame could not be taken (import/fence) x%llu", (unsigned long long)import_fail_);
-                if (++exBeginFail_ >= 30) {                     // каждый кадр подряд: GL-путь этому буферу не подходит
-                    exFail_ = true;
-                    LOGW("qcom-ex: the game buffer cannot be imported into GL (30 frames in a row) (WFG stays the frame generator)");
-                }
-                return;
-            }
-            exBeginFail_ = 0;
-        } else {
-            if (!getSource(j, fr, &src, &tmp)) { import_fail_++; if (import_fail_ % 120 == 1) LOGW("import of game buffer failed (usage/format?) x%llu", (unsigned long long)import_fail_); return; }
+        if (!getSource(j, fr, &src, &tmp)) { import_fail_++; if (import_fail_ % 120 == 1) LOGW("import of game buffer failed (usage/format?) x%llu", (unsigned long long)import_fail_); return; }
 
-            if (src->external && !plain_.image) { import_fail_++; return; }
-            if (isDuplicate(j, src)) { dup_skipped_++; return; }         // повтор: интервал считается между уникальными кадрами
-        }
+        if (src->external && !plain_.image) { import_fail_++; return; }
+        if (isDuplicate(j, src)) { dup_skipped_++; return; }         // повтор: интервал считается между уникальными кадрами
         Slot* real = takeFree(real_, kReal);
         if (!real) {                         // нет свободного слота: этот кадр оверлею не достанется
             dropped_real_++;
@@ -1452,8 +1394,6 @@ private:
         }
         const int64_t period = period_ns_.load();
         const float refresh = period > 1000000 ? 1.0e9f / (float)period : 60.0f;
-
-        if (ex) { processEx(j, w, h, real, base, dtPts, dt_ok, refresh); return; }
 
         uint32_t planned = 0;
         bool wfg_ok = false;
@@ -1618,7 +1558,43 @@ private:
         if (useUp) {
             const HdrParams hp = hdrParams();
             int n = 0;
-            auto upPass = [&](Slot* dst, VkImageView sv) { recordUpPass(cb, dst, sv, n, w, h, hp); };
+            auto upPass = [&](Slot* dst, VkImageView sv) {
+                if (hdrDirect_) {
+                    // прямая запись в кольцо: один dispatch, старый layout — реальный (GENERAL), а не UNDEFINED
+                    const int si = (int)(dst - hdrS_);
+                    barrier(cb, dst->im.image, hdrInited_[si] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, FOREIGN, Q);
+                    hdrInited_[si] = true;
+                    hdr_.record(vk_, cb, frIdx_ * 8 + n++, sv, hdrV_[si], w, h, hp);
+                    barrier(cb, dst->im.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_ACCESS_SHADER_WRITE_BIT, 0, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, Q, FOREIGN);
+                } else {
+                    // запасной путь: kPlain промежуточных образов по кругу, проходы не ждут друг друга
+                    PlainImage& ph = plainH_[n % kPlain];
+                    const int pi = n % kPlain;
+                    // образ остался в TRANSFER_SRC_OPTIMAL после копии предыдущего прохода
+                    barrier(cb, ph.image, phInited_[pi] ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    phInited_[pi] = true;
+                    hdr_.record(vk_, cb, frIdx_ * 8 + n++, sv, ph.view, w, h, hp);
+                    barrier(cb, ph.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    barrier(cb, dst->im.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            0, VK_ACCESS_TRANSFER_WRITE_BIT, ALL, VK_PIPELINE_STAGE_TRANSFER_BIT, FOREIGN, Q);
+                    VkImageCopy cp{};
+                    cp.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    cp.extent = {w, h, 1};
+                    vk_.f.CmdCopyImage(cb, ph.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       dst->im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+                    barrier(cb, dst->im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, Q, FOREIGN);
+                }
+            };
             for (uint32_t g = 0; g < planned; g++) if (upGen[g]) upPass(upGen[g], outV_[gen[g] - out_]);
             if (upReal) upPass(upReal, realV_[real - real_]);
         }
@@ -1681,7 +1657,15 @@ private:
         // постоянно в прошлом, «догон» (dropLate > 1.5 периода) выкидывал gen-кадры
         // вразнобой — итоговый FPS плавал вместо 120. Теперь λ поглощает всю латентность:
         // base = pts + λ ≈ момент готовности блока, цель gen-кадра снова в будущем.
-        lambdaUpdate(j);
+        if (j.pts_ns > 0) {
+            const int64_t lam = now_ns() - j.pts_ns;             // метка источника → готовность блока к показу
+            if (!lamValid_) { lamEma_ = (double)lam; lamValid_ = true; }
+            else if (llabs(lam - (int64_t)lamEma_) > 60000000LL) {   // скачок: seek/смена источника
+                if (lamResets_ < 8) LOGD("pts-phase: clock jump %+lld ms, resetting", (long long)(lam - (int64_t)lamEma_) / 1000000);
+                lamEma_ = (double)lam; lamResets_++;
+            } else lamEma_ += (double)(lam - lamEma_) * 0.20;    // τ ≈ 5 кадров на 30 fps
+            lamSamples_++;
+        }
         const uint64_t rg = ringGen_.load();          // поколение кольца этих слотов
         for (uint32_t g = 0; g < planned; g++) {
             OutItem it;
@@ -1721,280 +1705,6 @@ private:
         src_cnt_++;
     }
 
-    // Проход SDR->HDR одного кадра: sv — вид исходника (RGBA8, GENERAL), dst — слот hdr-кольца; n — счётчик
-    // дескрипторных наборов кадра (frIdx_*8+n). Общий для WFG-пути и qcom_ex.
-    void recordUpPass(VkCommandBuffer cb, Slot* dst, VkImageView sv, int& n, uint32_t w, uint32_t h, const HdrParams& hp) {
-        const uint32_t FOREIGN = VK_QUEUE_FAMILY_FOREIGN_EXT, Q = vk_.qfam;
-        const VkPipelineStageFlags ALL = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-        (void)ALL;
-        if (hdrDirect_) {
-            // прямая запись в кольцо: один dispatch, старый layout — реальный (GENERAL), а не UNDEFINED
-            const int si = (int)(dst - hdrS_);
-            barrier(cb, dst->im.image, hdrInited_[si] ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, FOREIGN, Q);
-            hdrInited_[si] = true;
-            hdr_.record(vk_, cb, frIdx_ * 8 + n++, sv, hdrV_[si], w, h, hp);
-            barrier(cb, dst->im.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_ACCESS_SHADER_WRITE_BIT, 0, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, Q, FOREIGN);
-        } else {
-            // запасной путь: kPlain промежуточных образов по кругу, проходы не ждут друг друга
-            PlainImage& ph = plainH_[n % kPlain];
-            const int pi = n % kPlain;
-            // образ остался в TRANSFER_SRC_OPTIMAL после копии предыдущего прохода
-            barrier(cb, ph.image, phInited_[pi] ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-            phInited_[pi] = true;
-            hdr_.record(vk_, cb, frIdx_ * 8 + n++, sv, ph.view, w, h, hp);
-            barrier(cb, ph.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            barrier(cb, dst->im.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    0, VK_ACCESS_TRANSFER_WRITE_BIT, ALL, VK_PIPELINE_STAGE_TRANSFER_BIT, FOREIGN, Q);
-            VkImageCopy cp{};
-            cp.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            cp.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            cp.extent = {w, h, 1};
-            vk_.f.CmdCopyImage(cb, ph.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               dst->im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
-            barrier(cb, dst->im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, Q, FOREIGN);
-        }
-    }
-
-    // ---- Adreno extrapolation (qcom_ex) ----------------------------------------------------------------
-    // Сколько предсказанных кадров показывать на кадр игры. Тот же смысл, что у планировщика WFG (пол по
-    // частоте источника 20/24 fps с гистерезисом, потолок по частоте экрана), но проще: предсказание
-    // дальше трёх четвертей шага уже сильно врёт, а сглаживание частоты источника даёт src_ema_.
-    uint32_t exPlan(uint32_t cap, float refresh) {
-        if (cap == 0 || src_n_ < 8 || src_ema_ < 1.0) { exN_ = 0; exCand_ = 0; exCandCnt_ = 0; return 0; }
-        const double rate = src_ema_;
-        exFast_ = exFast_ ? rate >= 20.0 : rate >= 24.0;
-        int n = 0;
-        if (exFast_) {
-            if (g_cfg.multiplier >= 2) n = g_cfg.multiplier - 1;
-            else {
-                double desired = g_cfg.target_fps > 0 ? (double)g_cfg.target_fps : (double)refresh;
-                if (refresh > 1.0f && desired > (double)refresh) desired = (double)refresh;
-                const double ratio = desired / rate;
-                n = ratio <= 1.0 ? 0 : (int)floor(ratio + 0.2) - 1;
-            }
-        }
-        if (refresh > 1.0f) n = std::min(n, std::max(0, (int)floor((double)refresh * 1.10 / rate) - 1));   // не больше, чем покажет экран
-        n = std::max(0, std::min(n, (int)cap));
-        // рост подтверждаем 4 кадрами подряд (дрожание частоты источника не должно мигать планом), спад — сразу
-        if (n > exN_) {
-            if (n == exCand_) { if (++exCandCnt_ >= 4) { exN_ = n; exCandCnt_ = 0; } }
-            else { exCand_ = n; exCandCnt_ = 1; }
-        } else { exN_ = n; exCand_ = n; exCandCnt_ = 0; }
-        return (uint32_t)std::min<int>(exN_, (int)cap);
-    }
-
-    // Кадр игры уже в приватной текстуре острова (qcomEx::begin). Здесь: слоты, real + предсказания, очередь вывода.
-    // real показывается сразу (цель = якорь блока), i-е предсказание — через dt·(i+1)/(n+1) после него:
-    // это и убирает задержку интерполяции, но плату за неё берёт качество предсказания.
-    // SDR->HDR: кадры лежат в кольцах real/gen (записаны GL), HDR-проход — отдельный Vulkan-submit,
-    // который ждёт GL-fence и пишет PQ-копии в hdr-кольцо; показываются копии, real/gen уходят по fence.
-    void processEx(capture::Job& j, uint32_t w, uint32_t h, Slot* real, int64_t base, int64_t dtPts, bool dt_ok, float refresh) {
-        bool useUp = false;
-        if (g_cfg.hdr) {
-            if (hdrAllowed()) useUp = ensureHdr(w, h);
-        } else if (nHdr_ > 0) {                      // HDR выключили на ходу: кольцо больше не держим
-            clearQueue();
-            vk_.f.DeviceWaitIdle(vk_.dev);
-            freeHdr();
-            LOGI("HDR off: output returns to SDR");
-        }
-        uint32_t cap = std::min<uint32_t>({(uint32_t)effMaxGen(), (uint32_t)VKR_DIS_MAX_GENERATIONS, (uint32_t)freeCount(out_, nOut_)});
-        if (useUp) {                                  // каждый выходной кадр занимает ещё слот hdr-кольца (план + real)
-            const int fh = freeCount(hdrS_, nHdr_) - 1;
-            cap = std::min<uint32_t>(cap, (uint32_t)std::max(0, fh));
-        }
-        if (!dt_ok) cap = 0;
-        const bool slow = g_cfg.min_fps > 0 && src_n_ >= 8 && src_ema_ < (double)g_cfg.min_fps;
-        if (slow) cap = 0;
-        if (slow != slow_paused_) {
-            slow_paused_ = slow;
-            LOGI(slow ? "interpolation paused: game at %.1f fps < min_fps %d" : "interpolation resumed: game at %.1f fps", src_ema_, g_cfg.min_fps);
-        }
-        if (therm_on_.load()) {
-            const double fps = src_n_ >= 8 ? src_ema_ : (dtPts > 0 ? 1.0e9 / (double)dtPts : 0.0);
-            if (fps > 1.0) {
-                const uint32_t allow = (uint32_t)((double)g_cfg.thermal_hz / fps);
-                cap = std::min<uint32_t>(cap, allow > 0 ? allow - 1u : 0u);
-            }
-        }
-        uint32_t planned = exPlan(cap, refresh);
-        Slot* gen[VKR_DIS_MAX_GENERATIONS] = {};
-        Slot* upGen[VKR_DIS_MAX_GENERATIONS] = {};
-        Slot* upReal = nullptr;
-        AHardwareBuffer* gAhb[VKR_DIS_MAX_GENERATIONS] = {};
-        float sc[VKR_DIS_MAX_GENERATIONS] = {};
-        uint32_t got = 0;
-        for (uint32_t g = 0; g < planned; g++) { gen[g] = takeFree(out_, nOut_); if (!gen[g]) break; got++; }
-        planned = got;
-        if (useUp) {
-            for (uint32_t g = 0; g < planned; g++) upGen[g] = takeFree(hdrS_, nHdr_);
-            upReal = takeFree(hdrS_, nHdr_);
-            if (!upReal) {
-                // слота даже для real нет: кадр целиком уходит как SDR, чтобы не чередовать PQ и SDR
-                for (uint32_t g = 0; g < planned; g++) if (upGen[g]) { upGen[g]->hold.store(0); upGen[g] = nullptr; }
-                useUp = false;
-            } else {
-                // предсказание без hdr-слота не показываем: смешение PQ и SDR даёт мерцание яркости
-                uint32_t m = 0;
-                for (uint32_t g = 0; g < planned; g++) {
-                    if (upGen[g]) { upGen[m] = upGen[g]; gen[m] = gen[g]; if (m != g) { gen[g] = nullptr; upGen[g] = nullptr; } m++; }
-                    else gen[g]->hold.store(0);
-                }
-                planned = m;
-            }
-        }
-        for (uint32_t g = 0; g < planned; g++) { gAhb[g] = gen[g]->im.ahb; sc[g] = (float)(g + 1) / (float)(planned + 1); }
-
-        if ((int)planned != exLogged_) {                                  // «план» для WebUI («По логу…»)
-            exLogged_ = (int)planned;
-            const double r = src_ema_ > 0.0 ? src_ema_ : (dtPts > 0 ? 1.0e9 / (double)dtPts : 0.0);
-            LOGI("extrapolation plan: source %.1f fps, target %.1f fps, ratio %.2f -> %u generated", r, r * (double)(planned + 1), (double)(planned + 1), planned);
-        }
-        // подсказка частоты слоя (auto_rate) — как в основном пути
-        if ((int)planned == plan_last_) plan_stable_++; else { plan_last_ = (int)planned; plan_stable_ = 0; }
-        if (g_cfg.auto_rate && src_n_ >= 8 && plan_stable_ >= 30) {
-            double r = src_ema_ * (double)(planned + 1);
-            if (refresh > 1.0f && r > (double)refresh) r = (double)refresh;
-            want_rate_.store((float)floor(r + 0.5));
-        }
-
-        auto releaseAll = [&](uint32_t from) {
-            for (uint32_t g = from; g < planned; g++) { if (gen[g]) gen[g]->hold.store(0); if (upGen[g]) upGen[g]->hold.store(0); }
-        };
-        uint32_t done = 0;
-        int fd = -1;
-        if (!qcomEx::finish(real->im.ahb, planned, gAhb, sc, planned > 0, &done, &fd)) {
-            // real не записан (слот не обернулся в GL-цель / ошибка): кадр потерян, оверлей не должен залипать на старом
-            real->hold.store(0);
-            if (upReal) upReal->hold.store(0);
-            releaseAll(0);
-            dropped_real_++;
-            hide_req_.store(true);
-            if (!qcomEx::available() || ++exFinishFail_ >= 5) {
-                if (!exFail_) LOGW("qcom-ex: ring buffers cannot be written through GL (WFG stays the frame generator)");
-                exFail_ = true;
-            }
-            return;
-        }
-        exFinishFail_ = 0;
-        releaseAll(done);                    // предсказание не получилось (первый кадр цепочки / ошибка GL)
-        planned = done;
-        if (qcomEx::gpuEmaMs() > 0.0) gpu_ema_ = qcomEx::gpuEmaMs();       // HUD / строка статистики
-
-        // ---- HDR: Vulkan-проход по готовым GL-кадрам ----------------------------------------------
-        if (useUp) {
-            FrameRes& fr = fr_[frIdx_];             // waitFrame(fr) уже выполнен в process()
-            const uint32_t FOREIGN = VK_QUEUE_FAMILY_FOREIGN_EXT, Q = vk_.qfam;
-            const VkAccessFlags RW = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-            VkCommandBuffer cb = fr.cb;
-            vk_.f.ResetCommandBuffer(cb, 0);
-            VkCommandBufferBeginInfo bi{};
-            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vk_.f.BeginCommandBuffer(cb, &bi);
-            if (fr.qp) {                            // t0=t1: «генерации» в этом submit нет, замеряется только HDR
-                vk_.f.CmdResetQueryPool(cb, fr.qp, 0, 3);
-                vk_.f.CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, fr.qp, 0);
-                vk_.f.CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, fr.qp, 1);
-            }
-            // кадры записаны GL: забираем у FOREIGN (содержимое сохраняется, fence GL ждёт семафор submit'а)
-            auto acquire = [&](VkImage im) {
-                barrier(cb, im, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_SHADER_READ_BIT,
-                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, FOREIGN, Q);
-            };
-            auto giveBack = [&](VkImage im) {       // источник снова в распоряжении GL
-                barrier(cb, im, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, RW, 0,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, Q, FOREIGN);
-            };
-            const HdrParams hp = hdrParams();
-            int n = 0;
-            for (uint32_t g = 0; g < planned; g++) acquire(gen[g]->im.image);
-            acquire(real->im.image);
-            for (uint32_t g = 0; g < planned; g++) recordUpPass(cb, upGen[g], outV_[gen[g] - out_], n, w, h, hp);
-            recordUpPass(cb, upReal, realV_[real - real_], n, w, h, hp);
-            for (uint32_t g = 0; g < planned; g++) giveBack(gen[g]->im.image);
-            giveBack(real->im.image);
-            if (fr.qp) vk_.f.CmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, fr.qp, 2);
-            vk_.f.EndCommandBuffer(cb);
-
-            bool waited = false;
-            if (fd >= 0) {
-                if (vk_.importSyncFd(fr.wait_sem, fd)) { waited = true; fd = -1; }     // fd забрал импорт
-                else { struct pollfd p = {fd, POLLIN, 0}; poll(&p, 1, 20); }           // импорт невозможен: ждём на CPU
-            }
-            const VkPipelineStageFlags wst = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-            VkSubmitInfo si{};
-            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            si.waitSemaphoreCount = waited ? 1 : 0;
-            si.pWaitSemaphores = &fr.wait_sem;
-            si.pWaitDstStageMask = &wst;
-            si.commandBufferCount = 1;
-            si.pCommandBuffers = &cb;
-            si.signalSemaphoreCount = vk_.can_export_syncfd ? 1 : 0;
-            si.pSignalSemaphores = &fr.sig_sem;
-            if (vk_.f.QueueSubmit(vk_.queue, 1, &si, fr.fence) != VK_SUCCESS) {
-                LOGE("vkQueueSubmit failed (qcom-ex HDR)");
-                if (fd >= 0) close(fd);
-                real->hold.store(0);
-                upReal->hold.store(0);
-                releaseAll(0);
-                dropped_real_++;
-                hide_req_.store(true);
-                return;
-            }
-            fr.submitted = true;
-            fr.timed = fr.qp != VK_NULL_HANDLE;
-            fr.planned = 0;                         // время GL-генерации в governor не идёт (gpu_ema_ выше)
-            fr.fence_rel_gen = ringGen_;
-            fr.fence_rel.push_back(real);           // real/gen нужны только HDR-проходу этого submit'а
-            for (uint32_t g = 0; g < planned; g++) fr.fence_rel.push_back(gen[g]);
-            frIdx_ = (frIdx_ + 1) % kFrames;
-            fd = vk_.can_export_syncfd ? vk_.exportSyncFd(fr.sig_sem) : -1;
-            if (fd < 0) {                           // нет sync_fd: недописанный буфер отдавать нельзя
-                if (vk_.f.WaitForFences(vk_.dev, 1, &fr.fence, VK_TRUE, 100000000ull) == VK_TIMEOUT)
-                    vk_.f.DeviceWaitIdle(vk_.dev);
-            }
-        }
-
-        lambdaUpdate(j);
-        const int64_t base_out = base;
-        const uint64_t rg = ringGen_.load();
-        OutItem it;
-        Slot* rs = useUp ? upReal : real;
-        AHardwareBuffer_acquire(rs->im.ahb);
-        it.ahb = rs->im.ahb; it.slot = rs;
-        it.fence_fd = fd >= 0 ? dup(fd) : -1;
-        it.target_ns = base_out;
-        it.transform = j.transform; it.w = (int)(j.cr - j.cl); it.h = (int)(j.cb - j.ct);
-        it.dataspace = j.dataspace; it.real = true; it.hdr = useUp;
-        it.rgen = rg;
-        push(it);
-        src_cnt_++;
-        for (uint32_t g = 0; g < planned; g++) {
-            OutItem e;
-            Slot* gs = useUp ? upGen[g] : gen[g];
-            AHardwareBuffer_acquire(gs->im.ahb);
-            e.ahb = gs->im.ahb; e.slot = gs;
-            e.fence_fd = fd >= 0 ? dup(fd) : -1;
-            e.target_ns = base_out + (int64_t)((double)dtPts * (double)(g + 1) / (double)(planned + 1));
-            e.transform = j.transform; e.w = it.w; e.h = it.h;
-            e.dataspace = j.dataspace; e.real = false; e.hdr = useUp;
-            e.rgen = rg;
-            push(e);
-            gen_cnt_++;
-        }
-        if (fd >= 0) close(fd);
-    }
-
     void printStats() {
         if (!g_cfg.stats) return;
         const int64_t n = now_ns();
@@ -2020,17 +1730,6 @@ private:
         add("fmtRej", cs.rejected_fmt); add("protRej", cs.rejected_prot); add("slotMiss", cs.slot_miss);
         add("dropJob", cs.dropped_job);
         if (g_cfg.debug) add("queued", cs.queued);
-        // qcom_ex: предсказано кадров, CPU-время подачи (begin+finish) и GPU-время кадра (если есть таймер-запросы)
-        if (exWas_) {
-            const qcomEx::Stats es = qcomEx::takeStats();
-            if (es.frames && o < sizeof ex - 64) {
-                o += (size_t)snprintf(ex + o, sizeof ex - o, " ex=%llu/%llu exCpu=%.1f/%.1fms", (unsigned long long)es.extrapolated,
-                                      (unsigned long long)es.frames, es.cpuAvgMs, es.cpuMaxMs);
-                if (es.gpuSamples && o < sizeof ex - 40)
-                    o += (size_t)snprintf(ex + o, sizeof ex - o, " exGpu=%.1f/%.1fms", es.gpuAvgMs, es.gpuMaxMs);
-            }
-            add("dropEx", dropped_ex_);
-        }
         char gv[64] = "";
         if (gov_level_ > 0) snprintf(gv, sizeof gv, " gov=%d", gov_level_);
         char upn[48] = "";
@@ -2128,13 +1827,6 @@ private:
     bool therm_no_sensor_ = false;
     // SDR -> HDR
     HdrPass hdr_;
-    // ---- аппаратная экстраполяция (qcom_ex)
-    bool exFail_ = false;                 // qcom_ex включён, но модуль не встал / умер: без повторов, работает WFG
-    bool exWas_ = false;                  // режим активен на предыдущем кадре (для переходов и статистики)
-    std::atomic<bool> exMode_{false};     // читает push() (потоки vsync/конвейера)
-    bool exFast_ = false;
-    int exN_ = 0, exCand_ = 0, exCandCnt_ = 0, exLogged_ = -1, exBeginFail_ = 0, exFinishFail_ = 0;
-    uint64_t dropped_ex_ = 0;             // предсказания, отменённые пришедшим реальным кадром
     // ---- пейсинг с обратной связью (см. paceOnComplete)
     static constexpr int64_t kPaceGuardStepNs = 250000;   // ступень надбавки: 250 мкс
     static constexpr int64_t kPaceGuardMaxNs  = 2500000;  // потолок надбавки: 2.5 мс

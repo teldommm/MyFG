@@ -24,7 +24,6 @@ MyFG injects into the game process, captures its frames, builds intermediate fra
 - **Thermal throttling** based on battery temperature.
 - **SDR → HDR10** (BT.2020 + PQ) with brightness, contrast and saturation controls.
 - **HUD** with FPS / GAME / GEN / GPU counters.
-- **Adreno extrapolation** (`qcom_ex`, experimental): instead of interpolating, the Adreno driver predicts frames from the last two (`GL_QCOM_frame_extrapolation`). No interpolation delay, but lower quality; replaces WFG. If the extension is missing or its self-test fails, WFG interpolation runs as before.
 - **Duplicate frame detection** (game posts 60 fps with 30 unique frames).
 - **WebUI**: global settings plus per-game profiles; some settings apply live, without restarting the game.
 
@@ -107,7 +106,6 @@ MyFG внедряется в процесс игры, перехватывает
 - **Термо-троттлинг** по температуре батареи.
 - **SDR → HDR10** (BT.2020 + PQ) с настройкой яркости, контраста и насыщенности.
 - **HUD** со счётчиком FPS / GAME / GEN / GPU.
-- **Экстраполяция Adreno** (`qcom_ex`, экспериментально): вместо интерполяции драйвер Adreno предсказывает кадры по двум последним (`GL_QCOM_frame_extrapolation`). Без задержки интерполяции, но качество ниже; заменяет WFG. Нет расширения или самотест не прошёл — работает интерполяция WFG, как раньше.
 - **Детект повторных кадров** (игра постит 60 к/с при 30 уникальных).
 - **WebUI:** глобальные настройки и отдельный профиль на каждую игру; часть настроек применяется на лету.
 

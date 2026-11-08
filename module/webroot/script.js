@@ -65,7 +65,6 @@ const SCHEMA = [
     { k: 'pts_phase', t: 'bool', def: 1, icon: '⏱️', dyn: 'ptshint' },
     { k: 'dup_detect', t: 'bool', def: 0, icon: '👯' },
     { k: 'dup_thresh', t: 'pick', def: 2, min: 0, max: 64, vals: [0, 2, 6], opts: ['pk_exact', 'pk_normal', 'pk_soft'], icon: '📏', dep: [['dup_detect', '=', 1]], dyn: 'duphint' },
-    { k: 'qcom_ex',   t: 'bool', def: 0, icon: '🔮', dyn: 'exhint' },
     { k: 'panel_game_vote', t: 'bool', def: 1, icon: '🗳️', dep: [['panel_hz', '>', 0]] },
     { k: 'panel_anchor',    t: 'bool', def: 0, icon: '⚓', dep: [['panel_hz', '>', 0]] },
     { k: 'hdr_peak', t: 'num', def: 0, min: 0, max: 1400, step: 50, zsnap: 400, sl: 1, smin: 400, unit: 'nit', icon: '🔆', z: 'z_auto', quick: [0, 600, 800, 1000, 1200], dep: [['hdr', '=', 1]] },
@@ -171,10 +170,8 @@ ru: {
   k_multiplier: 'Множитель', d_multiplier: 'Сколько кадров выводится на один кадр игры: ×2 — один добавленный, ×3 — два и т.д. Не больше, чем успевает показать экран.',
   k_dup_detect: 'Детект повторных кадров', d_dup_detect: 'Пропускает повторы, когда игра постит 60 к/с при 30 уникальных. Цена: ожидание CPU на каждый кадр. Не работает с буферами во внешнем формате (YCbCr).',
   k_pts_phase: 'Фаза по меткам источника', d_pts_phase: 'Ритм и фаза вывода берутся из меток времени кадров (PTS), а не из момента прибытия: убирает дрожание (judder) на 24/30 fps → 120 Гц. Нет PTS — откат на момент прибытия.',
-  k_qcom_ex: 'Экстраполяция Adreno', d_qcom_ex: 'Кадры предсказывает драйвер Adreno (GL_QCOM_frame_extrapolation): без задержки интерполяции, но качество ниже. Заменяет WFG. Экспериментально.',
   k_pacing: 'Пейсинг с обратной связью', d_pacing: 'По onComplete измеряется момент показа; при стабильном опоздании разрешаются более ранние таймлайны (до +2.5 мс), при запасе надбавка снимается. Нужны onComplete и Android 13+.',
   dyn_ptshint: 'По логу часть кадров без PTS — для них фаза берётся по моменту прибытия.',
-  dyn_exhint: 'По логу экстраполяция недоступна (нет расширения, ошибка GL или самотест не прошёл) — работает интерполяция WFG.',
   dyn_thermhint: 'По логу датчика температуры батареи нет — ограничение неактивно, вывод всегда на полном темпе.',
   k_dup_thresh: 'Порог повтора', d_dup_thresh: 'Насколько кадры должны различаться, чтобы считаться разными: «Точные» пропускают только идентичные, «Мягкий» — и почти одинаковые.',
   k_panel_hz: 'Частота панели', d_panel_hz: 'Просит SurfaceFlinger эту частоту панели для слоя модуля и окна игры; 0 — не трогать. Быстрый выбор — режимы вашего экрана.',
@@ -295,10 +292,8 @@ en: {
   k_multiplier: 'Multiplier', d_multiplier: 'Output frames per game frame: ×2 = one added frame, ×3 = two, and so on. Capped by what the display can show.',
   k_dup_detect: 'Duplicate-frame detection', d_dup_detect: 'Skips repeats when the game posts 60 fps with 30 unique. Cost: a CPU wait every frame. Does not work with external-format (YCbCr) buffers.',
   k_pts_phase: 'Phase from source timestamps', d_pts_phase: 'Output rhythm and phase come from frame timestamps (PTS) instead of arrival time: removes judder at 24/30 fps → 120 Hz. No PTS = falls back to arrival time.',
-  k_qcom_ex: 'Adreno extrapolation', d_qcom_ex: 'The Adreno driver predicts frames (GL_QCOM_frame_extrapolation): no interpolation delay, but lower quality. Replaces WFG. Experimental.',
   k_pacing: 'Feedback pacing', d_pacing: 'onComplete measures the present time; a steady lateness allows earlier timelines (up to +2.5 ms), and the slack is dropped when there is headroom. Needs onComplete and Android 13+.',
   dyn_ptshint: 'Per the log some frames carry no PTS; those keep the arrival-based phase.',
-  dyn_exhint: 'Per the log extrapolation is unavailable (no extension, a GL error or the self-test failed): WFG interpolation runs.',
   dyn_thermhint: 'Per the log there is no battery temperature sensor: the cap is inactive, output always runs at full rate.',
   k_dup_thresh: 'Duplicate threshold', d_dup_thresh: 'How different frames must be to count as new: “Exact” skips identical frames only, “Soft” also nearly identical ones.',
   k_panel_hz: 'Panel rate', d_panel_hz: 'Asks SurfaceFlinger for this panel rate for the module layer and the game window; 0 = leave alone. Quick values are your display modes.',
@@ -862,7 +857,7 @@ function paintExpert() {
 
 /* Сведения из лога выбранной игры. Показываем «что получилось» только для запущенной игры: у остановленной
    (или с выключенной генерацией, или стоящей в меню) прежняя строка вводила бы в заблуждение. */
-const INFO = { plan: null, stats: null, idle: false, paused: false, running: false, govFlow: 0, queue: null, dupUnavail: false, hdrNo: false, ptsPartial: false, exOff: false, thermNo: false, thermCapped: false };
+const INFO = { plan: null, stats: null, idle: false, paused: false, running: false, govFlow: 0, queue: null, dupUnavail: false, hdrNo: false, ptsPartial: false, thermNo: false, thermCapped: false };
 const LINE_PID = /^[VDIWEF]\/\S*\s*\(\s*(\d+)\)/;
 const linePid = l => { const m = LINE_PID.exec(l); return m ? m[1] : null; };
 
@@ -884,7 +879,7 @@ function scopeLog(res, sc) {
 }
 
 function parseInfo(text, running) {
-  INFO.plan = INFO.stats = INFO.queue = null; INFO.idle = INFO.paused = false; INFO.govFlow = 0; INFO.dupUnavail = false; INFO.hdrNo = false; INFO.ptsPartial = INFO.exOff = false; INFO.thermNo = INFO.thermCapped = false;
+  INFO.plan = INFO.stats = INFO.queue = null; INFO.idle = INFO.paused = false; INFO.govFlow = 0; INFO.dupUnavail = false; INFO.hdrNo = false; INFO.ptsPartial = false; INFO.thermNo = INFO.thermCapped = false;
   INFO.running = !!running;
   const lines = (text || '').split('\n');
   let decided = false, govSeen = false;
@@ -898,7 +893,7 @@ function parseInfo(text, running) {
       else if (/frame generation resumed/.test(l)) decided = true;
     }
     if (!INFO.plan) {
-      const p = l.match(/(?:WFG|extrapolation) plan: source ([\d.]+) fps, target ([\d.]+) fps, ratio [\d.]+ -> (\d+) generated/);
+      const p = l.match(/WFG plan: source ([\d.]+) fps, target ([\d.]+) fps, ratio [\d.]+ -> (\d+) generated/);
       if (p) INFO.plan = { src: +p[1], target: +p[2], gen: +p[3] };
     }
     if (!govSeen) { const g = l.match(/governor: level \d+.*flow_side=(\d+)/); if (g) { govSeen = true; INFO.govFlow = +g[1]; } }
@@ -906,7 +901,6 @@ function parseInfo(text, running) {
     if (/dup_detect unavailable/.test(l)) INFO.dupUnavail = true;
     if (/HDR: the panel reports no HDR support/.test(l)) INFO.hdrNo = true;
     if (/pts-phase: .*some frames carry no PTS/.test(l)) INFO.ptsPartial = true;
-    if (/qcom-ex: .*(WFG stays the frame generator)/.test(l)) INFO.exOff = true;
     if (/thermal: no battery temp sensor/.test(l)) INFO.thermNo = true;
     if (/thermal: battery .*C >= \d+C, output capped/.test(l)) INFO.thermCapped = true;
     if (/thermal: .*full rate restored/.test(l)) INFO.thermCapped = false;
@@ -1072,7 +1066,6 @@ function paintCustom() {
     hdrhint: () => effective('hdr') === 1 && INFO.hdrNo,
     duphint: () => effective('dup_detect') === 1 && INFO.dupUnavail,
     ptshint: () => effective('pts_phase') === 1 && INFO.ptsPartial,
-    exhint: () => effective('qcom_ex') !== 0 && INFO.exOff,
     thermhint: () => effective('thermal') === 1 && INFO.thermNo,
   };
   document.querySelectorAll('[data-dyn]').forEach(e => e.classList.toggle('hidden', !(dyn[e.dataset.dyn] && dyn[e.dataset.dyn]())));

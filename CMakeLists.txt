@@ -71,8 +71,6 @@ add_library(myfg SHARED
   src/live.cpp
   src/hud.cpp
   src/hdr.cpp
-  src/qcom_ex.cpp
-  src/gl_island.cpp
   src/display.cpp
   src/vsync.cpp
   src/vk_ctx.cpp
@@ -89,7 +87,7 @@ target_link_options(myfg PRIVATE
   -Wl,-z,max-page-size=16384      # Android 15+/16: страницы 16 КБ
   -Wl,--gc-sections -Wl,--build-id=none -s)
 
-target_link_libraries(myfg PRIVATE dobby_static wfg log android nativewindow sync EGL GLESv3)
+target_link_libraries(myfg PRIVATE dobby_static wfg log android nativewindow sync)
 
 # Сборка родным clang из Termux (cmake/termux-toolchain.cmake): STL линкуем статически сами.
 # Через NDK (android.toolchain.cmake) это делает ANDROID_STL=c++_static.
