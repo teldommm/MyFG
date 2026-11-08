@@ -51,7 +51,7 @@ void Config::parse(const char* blob) {
         KEY(multiplier) KEY(dup_detect) KEY(dup_thresh) KEY(use_oncomplete) KEY(queue_prio) KEY(elect_blast)
         KEY(layer_tf) KEY(hook_bbq) KEY(ui_source) KEY(hook_sc) KEY(live) KEY(log) KEY(debug) KEY(hud) KEY(hud_mode) KEY(hud_pos) KEY(hud_scale) KEY(hud_tf) KEY(hdr) KEY(hdr_pw) KEY(hdr_peak) KEY(hdr_knee) KEY(hdr_boost) KEY(hdr_gamma) KEY(hdr_ct) KEY(hdr_sat) KEY(adaptive) KEY(gpu_budget)
         KEY(thermal) KEY(thermal_hi) KEY(thermal_lo) KEY(thermal_hz)
-        KEY(pts_phase) KEY(qcom_me) KEY(me_refine) KEY(me_dy_sign)
+        KEY(pts_phase) KEY(qcom_me) KEY(qcom_ex) KEY(me_refine) KEY(me_dy_sign)
         KEY(pacing)
 #undef KEY
         warnOnce(k, "unknown key, value", val);
@@ -124,6 +124,7 @@ void Config::sanitize() {
     clampi(thermal_hz, 30, 144);
     clampi(pts_phase, 0, 1);
     clampi(qcom_me, 0, 1);
+    clampi(qcom_ex, 0, 2);
     clampi(me_refine, 0, 2);
     clampi(me_dy_sign, 0, 2);
     clampi(pacing, 0, 1);
@@ -138,7 +139,7 @@ void Config::applyLive(const Config& n) {
     L(release_lag) L(stats) L(max_gen) L(target_fps) L(flow_side) L(panel_hz) L(panel_game_vote) L(panel_anchor)
     L(multiplier) L(dup_detect) L(dup_thresh) L(use_oncomplete) L(layer_tf) L(hdr) L(hdr_pw) L(hdr_peak) L(hdr_knee) L(hdr_boost) L(hdr_gamma) L(hdr_ct) L(hdr_sat) L(adaptive) L(gpu_budget)
     L(thermal) L(thermal_hi) L(thermal_lo) L(thermal_hz) L(log) L(debug) L(hud) L(hud_mode) L(hud_pos) L(hud_scale) L(hud_tf)
-    L(pts_phase) L(qcom_me) L(me_refine) L(me_dy_sign) L(pacing)
+    L(pts_phase) L(qcom_me) L(qcom_ex) L(me_refine) L(me_dy_sign) L(pacing)
     // Читаются на каждом кадре (elect()/blast_hint()), поэтому безопасно меняются на ходу.
     // Прежде live-правка target_w/target_h/elect_blast молча не действовала до рестарта игры.
     L(target_w) L(target_h) L(elect_blast) L(ui_source)
