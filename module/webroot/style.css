@@ -506,27 +506,41 @@ main { flex: 1; padding: 12px 16px; display: flex; flex-direction: column; gap: 
 .tu-step:active { transform: scale(0.92); background: #333; }
 .tu-step:disabled { opacity: 0.3; cursor: default; pointer-events: none; }
 
+/* Ползунок двигается только за кружок: сам input не принимает касаний (pointer-events: none),
+   кружок — принимает. Тап по полосе, по соседнему тексту или случайное касание при прокрутке значение
+   не меняют. Область кружка больше видимой (26 px при видимых 16 px) — за него удобно браться. */
 .tu-slider {
   --p: 0%;
   flex: 1; min-width: 0; height: 28px; margin: 0;
-  background: transparent; cursor: pointer;
+  background: transparent; cursor: default;
   -webkit-appearance: none; appearance: none;
+  pointer-events: none;
 }
 .tu-slider::-webkit-slider-runnable-track {
   height: 4px; border-radius: 2px;
   background: linear-gradient(to right, var(--accent) var(--p), rgba(255,255,255,0.20) var(--p));
 }
 .tu-slider::-webkit-slider-thumb {
-  -webkit-appearance: none; appearance: none;
-  width: 22px; height: 22px; margin-top: -9px; border-radius: 50%;
-  background: var(--accent); border: 3px solid var(--surface);
+  -webkit-appearance: none; appearance: none; box-sizing: border-box;
+  width: 26px; height: 26px; margin-top: -11px; border-radius: 50%;
+  background: var(--accent); border: 5px solid var(--surface);
   box-shadow: 0 0 0 1px var(--accent-line);
+  pointer-events: auto; cursor: grab; touch-action: pan-y;
 }
+.tu-slider::-webkit-slider-thumb:active { cursor: grabbing; }
 .tu-slider::-moz-range-track { height: 4px; border-radius: 2px; background: rgba(255,255,255,0.20); }
 .tu-slider::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--accent); }
-.tu-slider::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: var(--accent); border: 3px solid var(--surface); box-shadow: 0 0 0 1px var(--accent-line); }
+.tu-slider::-moz-range-thumb {
+  box-sizing: border-box; width: 26px; height: 26px; border-radius: 50%;
+  background: var(--accent); border: 5px solid var(--surface); box-shadow: 0 0 0 1px var(--accent-line);
+  pointer-events: auto; cursor: grab;
+}
 .tu-slider:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 6px; }
+/* заблокированный ползунок: кружок тоже не двигается */
 .tu-slider:disabled { cursor: default; }
+.tu-slider:disabled::-webkit-slider-thumb { pointer-events: none; cursor: default; }
+.tu-slider:disabled::-moz-range-thumb { pointer-events: none; cursor: default; }
+.dis .tu-slider, .dis .tu-slider::-webkit-slider-thumb, .dis .tu-slider::-moz-range-thumb { pointer-events: none; }
 
 .tu-quick { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .tu-qbtn {
@@ -554,7 +568,6 @@ main { flex: 1; padding: 12px 16px; display: flex; flex-direction: column; gap: 
 
 /* Зависимые настройки и выключенный модуль */
 .tu-row.dis, .tu-vm-row.dis { opacity: 0.4; pointer-events: none; }
-body.fg-off #settings .tu-card:not([data-g="general"]) { opacity: 0.55; }
 
 /* Сворачиваемые группы */
 .tu-card-header[role="button"] { cursor: pointer; }
